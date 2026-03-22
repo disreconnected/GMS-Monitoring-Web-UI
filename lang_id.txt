@@ -82,6 +82,9 @@ LONG_LOSS_VALUE = Long-term loss (~{seconds} dtk): {loss_pct:.1f}% (hilang: {los
 # Alerts
 ALERT_DELAY_SPIKE = PERINGATAN: spike delay terdeteksi (beberapa ping sangat lambat).
 ALERT_HIGH_LOSS = PERINGATAN: loss tinggi dalam beberapa detik terakhir (10% atau lebih).
+ALERT_CONSEC_RTO = PERINGATAN: {count} timeout berturut-turut saat ini (koneksi mungkin terputus).
+ALERT_CONSEC_RTO_RECURRING = PERINGATAN: {count} timeout berturut-turut saat ini, dan ini sudah terjadi {bursts} kali di window ini!
+ALERT_RTO_BURSTS = PERHATIAN: {bursts} ledakan timeout (3+ berturut-turut) terdeteksi di window ini — koneksi tidak stabil.
 
 # Traceroute
 TRACE_RUNNING = Route ke {host}: berjalan...

@@ -82,6 +82,9 @@ LONG_LOSS_VALUE = Long-term loss (~{seconds} sec): {loss_pct:.1f}% (timeouts: {l
 # Alerts
 ALERT_DELAY_SPIKE = ALERT: delay spike detected (one or more very slow checks).
 ALERT_HIGH_LOSS = ALERT: packet loss has been high in the last few seconds (10% or more).
+ALERT_CONSEC_RTO = ALERT: {count} consecutive timeouts right now (connection may be down).
+ALERT_CONSEC_RTO_RECURRING = ALERT: {count} consecutive timeouts right now, and this has happened {bursts} times in this window!
+ALERT_RTO_BURSTS = WARNING: {bursts} timeout bursts (3+ in a row) detected in this window — connection is unstable.
 
 # Traceroute
 TRACE_RUNNING = Route check to {host}: running...

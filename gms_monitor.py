@@ -131,6 +131,13 @@ class MonitorState:
         # Window used for "recent" stats and graphs (in checks)
         self.window_size = DEFAULT_WINDOW_SIZE
 
+        # Consecutive RTO (timeout) tracking
+        self.consecutive_rto = 0          # current streak of consecutive timeouts
+        self.max_consecutive_rto = 0      # longest streak this session
+        self.rto_burst_count = 0          # how many times we exceeded the threshold in the window
+        self.rto_burst_threshold = 3      # alert after this many consecutive timeouts
+        self.rto_history = deque(maxlen=LOSS_HISTORY_LENGTH)  # per-check: True=timeout, False=success
+
         # Traceroute
         self.traceroute_lines = []
         self.traceroute_running = False
@@ -210,6 +217,18 @@ def ping_worker(state: MonitorState, interval: float):
                         state.total_success += 1
                 else:
                     state.last_ping_ms = None
+
+                # Consecutive RTO tracking
+                if success:
+                    if state.consecutive_rto >= state.rto_burst_threshold:
+                        state.rto_burst_count += 1
+                    state.consecutive_rto = 0
+                    state.rto_history.append(False)
+                else:
+                    state.consecutive_rto += 1
+                    if state.consecutive_rto > state.max_consecutive_rto:
+                        state.max_consecutive_rto = state.consecutive_rto
+                    state.rto_history.append(True)
 
                 sent = state.total_sent
                 recv = state.total_recv
@@ -534,6 +553,12 @@ def draw_ui(stdscr, state: MonitorState):
         jitter_count_all = state.jitter_count_all
         target_host = state.target_host
 
+        consecutive_rto = state.consecutive_rto
+        max_consecutive_rto = state.max_consecutive_rto
+        rto_burst_count = state.rto_burst_count
+        rto_burst_threshold = state.rto_burst_threshold
+        rto_history = list(state.rto_history)
+
     # Header (not localized on purpose)
     title = "GMS Monitoring"
     stdscr.addnstr(0, 0, title[:max_x], max_x)
@@ -769,6 +794,42 @@ def draw_ui(stdscr, state: MonitorState):
 
         if alert_text:
             stdscr.addnstr(alert_y, 0, alert_text[:max_x], max_x)
+            alert_y += 1
+
+    # Consecutive RTO alerts
+    if alert_y < max_y:
+        rto_alert = ""
+        # Count RTO bursts (runs of >= threshold) within the current window
+        window_rto = rto_history[-window_size:] if window_size > 0 else []
+        bursts_in_window = 0
+        streak = 0
+        for timed_out in window_rto:
+            if timed_out:
+                streak += 1
+            else:
+                if streak >= rto_burst_threshold:
+                    bursts_in_window += 1
+                streak = 0
+        # Count a still-active streak at the end of the window
+        if streak >= rto_burst_threshold:
+            bursts_in_window += 1
+
+        if consecutive_rto >= rto_burst_threshold and bursts_in_window > 1:
+            # Currently in an RTO streak AND it has happened multiple times in the window
+            rto_alert = tr(
+                "ALERT_CONSEC_RTO_RECURRING",
+                count=consecutive_rto,
+                bursts=bursts_in_window,
+            )
+        elif consecutive_rto >= rto_burst_threshold:
+            # Currently in an RTO streak (first or only occurrence)
+            rto_alert = tr("ALERT_CONSEC_RTO", count=consecutive_rto)
+        elif bursts_in_window > 1:
+            # Not currently in a streak, but multiple bursts happened in the window
+            rto_alert = tr("ALERT_RTO_BURSTS", bursts=bursts_in_window)
+
+        if rto_alert:
+            stdscr.addnstr(alert_y, 0, rto_alert[:max_x], max_x)
             alert_y += 1
 
     # Traceroute section
