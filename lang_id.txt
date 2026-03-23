@@ -61,6 +61,12 @@ METRIC_PING_AVG_LABEL = Ping rata-rata
 METRIC_PING_P90_LABEL = Ping p90
 METRIC_PING_P99_LABEL = Ping p99
 METRIC_JITTER_LABEL = Jitter
+METRIC_BW_LABEL = Throughput
+
+BW_VALUE_WAIT = menunggu...
+BW_VALUE_ERROR = (counter n/a)
+BW_PAIR_MBPS = dn {down:.1f} / up {up:.1f} Mbps
+BW_ERROR_COUNTERS = Counter throughput tidak tersedia
 
 QUALITY_LABEL = Kualitas
 QUALITY_UNKNOWN = Tidak diketahui
@@ -85,6 +91,7 @@ ALERT_HIGH_LOSS = PERINGATAN: loss tinggi dalam beberapa detik terakhir (10% ata
 ALERT_CONSEC_RTO = PERINGATAN: {count} timeout berturut-turut saat ini (koneksi mungkin terputus).
 ALERT_CONSEC_RTO_RECURRING = PERINGATAN: {count} timeout berturut-turut saat ini, dan ini sudah terjadi {bursts} kali di window ini!
 ALERT_RTO_BURSTS = PERHATIAN: {bursts} ledakan timeout (3+ berturut-turut) terdeteksi di window ini — koneksi tidak stabil.
+ALERT_BW_SPIKE = PERINGATAN: lonjakan bandwidth ~{total:.1f} Mbps total (baseline ~{baseline:.1f} Mbps; dn {down:.1f} / up {up:.1f} Mbps).
 
 # Traceroute
 TRACE_RUNNING = Route ke {host}: berjalan...

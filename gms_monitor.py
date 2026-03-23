@@ -1,12 +1,31 @@
 #!/usr/bin/env python3
 import argparse
-import curses
+import statistics
 import threading
 import subprocess
+import sys
 import time
 import re
 import os
 from collections import deque
+
+try:
+    import curses
+except ImportError:
+    if sys.platform == "win32":
+        sys.stderr.write(
+            "The curses module is required. On Windows install: pip install windows-curses\n"
+        )
+    raise
+
+_WIN32 = sys.platform == "win32"
+
+
+def _subprocess_no_window_kwargs():
+    """Avoid flashing console windows when spawning ping/tracert on Windows."""
+    if _WIN32 and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
 
 # Localization ---------------------------------------------------------------
 
@@ -95,6 +114,16 @@ LOSS_HISTORY_LENGTH = 300
 MIN_WINDOW_SIZE = 10       # minimum number of recent checks
 DEFAULT_WINDOW_SIZE = 60   # default "time window" in checks (≈ seconds)
 
+# Bandwidth (interface totals → Mbps); anomaly vs rolling median in the same window
+BW_SAMPLE_INTERVAL = 1.0
+BW_HISTORY_LENGTH = 300
+BW_WARMUP_SAMPLES = 25
+BW_SPIKE_RATIO = 4.0
+BW_IDLE_BASELINE_MAX_MBPS = 0.25
+BW_ABSOLUTE_IDLE_SPIKE_MBPS = 10.0
+BW_MIN_DELTA_OVER_BASELINE_MBPS = 2.0
+BW_MIN_ALERT_TOTAL_MBPS = 3.0
+
 
 class MonitorState:
     def __init__(self, target_host: str):
@@ -145,19 +174,179 @@ class MonitorState:
         self.traceroute_summary = None
         self.last_traceroute_ts = None
 
+        # Throughput (all interfaces aggregate), sampled every BW_SAMPLE_INTERVAL
+        self.bw_rx_mbps_history = deque(maxlen=BW_HISTORY_LENGTH)
+        self.bw_tx_mbps_history = deque(maxlen=BW_HISTORY_LENGTH)
+        self.bw_last_error = None
+
+
+def _linux_net_totals_sysfs() -> tuple[int, int] | None:
+    rx = tx = 0
+    base = "/sys/class/net"
+    try:
+        for name in os.listdir(base):
+            if name == "lo":
+                continue
+            try:
+                with open(os.path.join(base, name, "statistics", "rx_bytes"), encoding="utf-8") as f:
+                    rx += int(f.read().strip())
+                with open(os.path.join(base, name, "statistics", "tx_bytes"), encoding="utf-8") as f:
+                    tx += int(f.read().strip())
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return rx, tx
+
+
+def _win_net_totals_powershell() -> tuple[int, int] | None:
+    script = (
+        "$r=0L;$s=0L; "
+        'Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | ForEach-Object { '
+        "$st = Get-NetAdapterStatistics -Name $_.Name; "
+        "$r += $st.ReceivedBytes; $s += $st.SentBytes }; "
+        'Write-Output ("{0} {1}" -f $r, $s)'
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            **_subprocess_no_window_kwargs(),
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        return None
+    line = proc.stdout.strip().splitlines()[-1].strip()
+    parts = line.split()
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def get_net_io_totals() -> tuple[int, int] | None:
+    """Cumulative bytes (recv, sent) across interfaces; None if unavailable."""
+    try:
+        import psutil
+
+        io = psutil.net_io_counters(pernic=False)
+        if io is None:
+            return None
+        return int(io.bytes_recv), int(io.bytes_sent)
+    except ImportError:
+        pass
+    except Exception:
+        return None
+
+    if _WIN32:
+        return _win_net_totals_powershell()
+    if sys.platform.startswith("linux"):
+        return _linux_net_totals_sysfs()
+    return None
+
+
+def bandwidth_worker(state: MonitorState):
+    last_rx: int | None = None
+    last_tx: int | None = None
+    last_t: float | None = None
+    while True:
+        with state.lock:
+            if not state.running:
+                break
+        time.sleep(BW_SAMPLE_INTERVAL)
+        totals = get_net_io_totals()
+        if totals is None:
+            with state.lock:
+                state.bw_last_error = tr("BW_ERROR_COUNTERS")
+            continue
+        with state.lock:
+            state.bw_last_error = None
+        rx, tx = totals
+        now = time.time()
+        if last_rx is not None and last_tx is not None and last_t is not None:
+            dt = now - last_t
+            if dt > 0.05:
+                drx = rx - last_rx
+                dtx = tx - last_tx
+                if drx < 0 or dtx < 0:
+                    drx = max(0, drx)
+                    dtx = max(0, dtx)
+                mbps_down = (drx * 8) / (dt * 1_000_000)
+                mbps_up = (dtx * 8) / (dt * 1_000_000)
+                with state.lock:
+                    state.bw_rx_mbps_history.append(mbps_down)
+                    state.bw_tx_mbps_history.append(mbps_up)
+        last_rx, last_tx, last_t = rx, tx, now
+
+
+def bandwidth_anomaly_message(
+    rx_hist: list[float],
+    tx_hist: list[float],
+    window_size: int,
+) -> str | None:
+    """Detect sustained spike vs median baseline in the window; returns tr() key rendered or None."""
+    n = len(rx_hist)
+    if n < BW_WARMUP_SAMPLES or len(tx_hist) != n:
+        return None
+    w = max(MIN_WINDOW_SIZE, min(window_size, n - 1))
+    if w < 5:
+        return None
+
+    totals = [rx_hist[i] + tx_hist[i] for i in range(n)]
+    curr = totals[-1]
+    baseline_slice = totals[-(w + 1) : -1]
+    if not baseline_slice:
+        return None
+    baseline = statistics.median(baseline_slice)
+
+    if curr < BW_MIN_ALERT_TOTAL_MBPS:
+        return None
+
+    spike = False
+    if baseline <= BW_IDLE_BASELINE_MAX_MBPS:
+        spike = curr >= BW_ABSOLUTE_IDLE_SPIKE_MBPS
+    else:
+        spike = curr >= baseline * BW_SPIKE_RATIO and (
+            curr - baseline
+        ) >= BW_MIN_DELTA_OVER_BASELINE_MBPS
+
+    if not spike:
+        return None
+
+    down_now = rx_hist[-1]
+    up_now = tx_hist[-1]
+    return tr(
+        "ALERT_BW_SPIKE",
+        total=curr,
+        baseline=baseline,
+        down=down_now,
+        up=up_now,
+    )
+
 
 def run_ping(host: str, timeout: float = 5.0):
     """
     Run a single ping and return (success: bool, rtt_ms: float|None).
-    Uses very generic flags to work on macOS and most Unix systems.
+    Windows: ping -n 1; Unix/macOS: ping -c 1 -n (numeric, no DNS lookups).
     """
     try:
-        # -c 1 -> send one packet; -n -> numeric output
+        if _WIN32:
+            # -n count; -w timeout_ms per reply (not the same as Unix -W)
+            w_ms = max(1000, int(timeout * 1000))
+            cmd = ["ping", "-n", "1", "-w", str(w_ms), host]
+        else:
+            cmd = ["ping", "-n", "-c", "1", host]
         proc = subprocess.run(
-            ["ping", "-n", "-c", "1", host],
+            cmd,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=timeout + 2.0,
+            **_subprocess_no_window_kwargs(),
         )
     except Exception:
         return False, None
@@ -165,8 +354,10 @@ def run_ping(host: str, timeout: float = 5.0):
     if proc.returncode != 0:
         return False, None
 
-    # Look for "time=XX.X ms" in the output
-    match = re.search(r"time[=<]([\d.]+)\s*ms", proc.stdout)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    # Windows: Reply from ...: time=24ms  or  time<1ms
+    # Unix/macOS: time=1.234 ms
+    match = re.search(r"time[=<]([\d.]+)\s*ms", out, re.IGNORECASE)
     if not match:
         return True, None  # success but no RTT parsed
 
@@ -175,6 +366,39 @@ def run_ping(host: str, timeout: float = 5.0):
     except ValueError:
         rtt = None
     return True, rtt
+
+
+def _tracert_style_host_ip(rest: str) -> tuple[str, str]:
+    """Parse host/IP from the tail of a Windows tracert hop line (RTTs first, host last)."""
+    rest = rest.strip()
+    if not rest:
+        return "?", ""
+    low = rest.lower()
+    if low.startswith("request timed out"):
+        return "?", ""
+
+    tokens = re.split(r"\s+", rest)
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "*":
+            i += 1
+            continue
+        if i + 1 < len(tokens) and tokens[i + 1].lower() == "ms":
+            if re.fullmatch(r"[\d.]+|<\d+", t):
+                i += 2
+                continue
+        break
+    host_tokens = tokens[i:]
+    if not host_tokens:
+        return "?", ""
+    host_str = " ".join(host_tokens)
+    if host_str.lower().rstrip(".") == "request timed out":
+        return "?", ""
+    # Plain IPv4 / hostname as single token
+    if "(" not in host_str and ")" not in host_str:
+        return host_str, ""
+    return host_str, ""
 
 
 def ping_worker(state: MonitorState, interval: float):
@@ -322,16 +546,13 @@ def build_traceroute_table(lines: list[str]) -> list[str]:
         host = "?"
         ip = ""
 
-        # Try to extract host and IP from "host (ip)" pattern
+        # Unix traceroute: "host (ip)  2.1 ms ..."; Windows tracert: "2 ms  2 ms  1.2.3.4"
         if "(" in rest and ")" in rest:
             before, after = rest.split("(", 1)
             host = before.strip() or "?"
             ip = after.split(")", 1)[0].strip()
         else:
-            # Fallback: first token is host or IP
-            parts = rest.split()
-            if parts:
-                host = parts[0]
+            host, ip = _tracert_style_host_ip(rest)
 
         host_ip = host
         if ip and ip not in host:
@@ -376,12 +597,17 @@ def traceroute_worker(state: MonitorState):
         host = state.target_host
     try:
         # Use Popen so we can stream output line by line.
+        if _WIN32:
+            cmd = ["tracert", "-d", "-h", "30", host]
+        else:
+            cmd = ["traceroute", host]
         proc = subprocess.Popen(
-            ["traceroute", host],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **_subprocess_no_window_kwargs(),
         )
     except Exception as e:
         with state.lock:
@@ -552,6 +778,10 @@ def draw_ui(stdscr, state: MonitorState):
         jitter_sum_all = state.jitter_sum_all
         jitter_count_all = state.jitter_count_all
         target_host = state.target_host
+
+        bw_rx_hist = list(state.bw_rx_mbps_history)
+        bw_tx_hist = list(state.bw_tx_mbps_history)
+        bw_last_error = state.bw_last_error
 
         consecutive_rto = state.consecutive_rto
         max_consecutive_rto = state.max_consecutive_rto
@@ -762,6 +992,28 @@ def draw_ui(stdscr, state: MonitorState):
 
     add_metric_row(tr("METRIC_JITTER_LABEL"), jitter_win_str, jitter_all_str)
 
+    # Throughput (aggregate); optional psutil or OS-specific counters
+    if bw_last_error:
+        bw_win_str = bw_all_str = tr("BW_VALUE_ERROR")
+    elif not bw_rx_hist or not bw_tx_hist:
+        bw_win_str = bw_all_str = tr("BW_VALUE_WAIT")
+    else:
+        w_bw = min(window_size, len(bw_rx_hist))
+        wrx = bw_rx_hist[-w_bw:]
+        wtx = bw_tx_hist[-w_bw:]
+        bw_win_str = tr(
+            "BW_PAIR_MBPS",
+            down=sum(wrx) / len(wrx),
+            up=sum(wtx) / len(wtx),
+        )
+        bw_all_str = tr(
+            "BW_PAIR_MBPS",
+            down=sum(bw_rx_hist) / len(bw_rx_hist),
+            up=sum(bw_tx_hist) / len(bw_tx_hist),
+        )
+
+    add_metric_row(tr("METRIC_BW_LABEL"), bw_win_str, bw_all_str)
+
     table_bottom_y = row_y
 
     # Compute short-term stats for alerts
@@ -794,6 +1046,13 @@ def draw_ui(stdscr, state: MonitorState):
 
         if alert_text:
             stdscr.addnstr(alert_y, 0, alert_text[:max_x], max_x)
+            alert_y += 1
+
+    # Bandwidth spike vs rolling median (same window as ping stats)
+    if alert_y < max_y:
+        bw_alert = bandwidth_anomaly_message(bw_rx_hist, bw_tx_hist, window_size)
+        if bw_alert:
+            stdscr.addnstr(alert_y, 0, bw_alert[:max_x], max_x)
             alert_y += 1
 
     # Consecutive RTO alerts
@@ -939,6 +1198,13 @@ def main(stdscr, target_host: str):
         daemon=True,
     )
     ping_thread.start()
+
+    bw_thread = threading.Thread(
+        target=bandwidth_worker,
+        args=(state,),
+        daemon=True,
+    )
+    bw_thread.start()
 
     # Start initial traceroute
     traceroute_thread = threading.Thread(

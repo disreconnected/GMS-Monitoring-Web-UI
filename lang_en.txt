@@ -61,6 +61,12 @@ METRIC_PING_AVG_LABEL = Ping avg
 METRIC_PING_P90_LABEL = Ping p90
 METRIC_PING_P99_LABEL = Ping p99
 METRIC_JITTER_LABEL = Jitter
+METRIC_BW_LABEL = Throughput
+
+BW_VALUE_WAIT = waiting...
+BW_VALUE_ERROR = (counters n/a)
+BW_PAIR_MBPS = dn {down:.1f} / up {up:.1f} Mbps
+BW_ERROR_COUNTERS = Throughput counters unavailable
 
 QUALITY_LABEL = Quality
 QUALITY_UNKNOWN = Unknown
@@ -85,6 +91,7 @@ ALERT_HIGH_LOSS = ALERT: packet loss has been high in the last few seconds (10% 
 ALERT_CONSEC_RTO = ALERT: {count} consecutive timeouts right now (connection may be down).
 ALERT_CONSEC_RTO_RECURRING = ALERT: {count} consecutive timeouts right now, and this has happened {bursts} times in this window!
 ALERT_RTO_BURSTS = WARNING: {bursts} timeout bursts (3+ in a row) detected in this window — connection is unstable.
+ALERT_BW_SPIKE = ALERT: bandwidth spike ~{total:.1f} Mbps total (baseline ~{baseline:.1f} Mbps; dn {down:.1f} / up {up:.1f} Mbps).
 
 # Traceroute
 TRACE_RUNNING = Route check to {host}: running...
