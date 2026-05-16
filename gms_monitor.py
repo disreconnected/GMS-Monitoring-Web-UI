@@ -750,6 +750,32 @@ def compute_recent_stats(ping_history, window_size):
     )
 
 
+MIN_TERMINAL_ROWS = 24
+MIN_TERMINAL_COLS = 80
+
+
+def safe_addnstr(stdscr, y: int, x: int, text: str, max_y: int, max_x: int) -> None:
+    """Write a string without triggering curses ERR on screen edges.
+
+    curses raises ERR when a write would occupy the lower-right cell (y == max_y - 1
+    and the last column). Clip width on the bottom row and ignore out-of-bounds coords.
+    """
+    if not text or max_y <= 0 or max_x <= 0 or y < 0 or x < 0 or y >= max_y or x >= max_x:
+        return
+    width = max_x - x
+    if y >= max_y - 1:
+        width -= 1
+    if width <= 0:
+        return
+    snippet = text[:width]
+    if not snippet:
+        return
+    try:
+        stdscr.addnstr(y, x, snippet, width)
+    except curses.error:
+        pass
+
+
 def draw_ui(stdscr, state: MonitorState):
     stdscr.clear()
     max_y, max_x = stdscr.getmaxyx()
@@ -791,13 +817,13 @@ def draw_ui(stdscr, state: MonitorState):
 
     # Header (not localized on purpose)
     title = "GMS Monitoring"
-    stdscr.addnstr(0, 0, title[:max_x], max_x)
+    safe_addnstr(stdscr, 0, 0, title, max_y, max_x)
 
     # Instructions / controls (toggleable)
     if show_controls:
         # Table header: Key | Action (no separate title line)
         header_line = f"{'Key':<8}{tr('KEYS_ACTION_HEADER')}"
-        stdscr.addnstr(2, 0, header_line[:max_x], max_x)
+        safe_addnstr(stdscr, 2, 0, header_line, max_y, max_x)
 
         # Individual key rows
         key_rows = [
@@ -816,13 +842,13 @@ def draw_ui(stdscr, state: MonitorState):
             if row_y >= max_y:
                 break
             line = f"{key:<8}{desc}"
-            stdscr.addnstr(row_y, 0, line[:max_x], max_x)
+            safe_addnstr(stdscr, row_y, 0, line, max_y, max_x)
             row_y += 1
 
         controls_bottom_y = row_y - 1
     else:
         hint = tr("CONTROLS_HINT")
-        stdscr.addnstr(2, 0, hint[:max_x], max_x)
+        safe_addnstr(stdscr, 2, 0, hint, max_y, max_x)
         controls_bottom_y = 2
 
     # Top info table: status, ping now, quality, and window
@@ -843,7 +869,7 @@ def draw_ui(stdscr, state: MonitorState):
         if top_row_y >= max_y:
             return
         line = f"{label:<{label_width}} {value}"
-        stdscr.addnstr(top_row_y, 0, line[:max_x], max_x)
+        safe_addnstr(stdscr, top_row_y, 0, line, max_y, max_x)
         top_row_y += 1
 
     # Status row
@@ -915,7 +941,7 @@ def draw_ui(stdscr, state: MonitorState):
 
     if metrics_start_y < max_y:
         header = f"{'Metric':<14} {'Window (recent)':<18} {'Session (all)':<18}"
-        stdscr.addnstr(metrics_start_y, 0, header[:max_x], max_x)
+        safe_addnstr(stdscr, metrics_start_y, 0, header, max_y, max_x)
 
     row_y = metrics_start_y + 1
 
@@ -924,7 +950,7 @@ def draw_ui(stdscr, state: MonitorState):
         if row_y >= max_y:
             return
         line = f"{label:<14} {win:<18.18} {all_:<18.18}"
-        stdscr.addnstr(row_y, 0, line[:max_x], max_x)
+        safe_addnstr(stdscr, row_y, 0, line, max_y, max_x)
         row_y += 1
 
     # Loss row
@@ -1045,14 +1071,14 @@ def draw_ui(stdscr, state: MonitorState):
             alert_text = tr("ALERT_HIGH_LOSS")
 
         if alert_text:
-            stdscr.addnstr(alert_y, 0, alert_text[:max_x], max_x)
+            safe_addnstr(stdscr, alert_y, 0, alert_text, max_y, max_x)
             alert_y += 1
 
     # Bandwidth spike vs rolling median (same window as ping stats)
     if alert_y < max_y:
         bw_alert = bandwidth_anomaly_message(bw_rx_hist, bw_tx_hist, window_size)
         if bw_alert:
-            stdscr.addnstr(alert_y, 0, bw_alert[:max_x], max_x)
+            safe_addnstr(stdscr, alert_y, 0, bw_alert, max_y, max_x)
             alert_y += 1
 
     # Consecutive RTO alerts
@@ -1088,7 +1114,7 @@ def draw_ui(stdscr, state: MonitorState):
             rto_alert = tr("ALERT_RTO_BURSTS", bursts=bursts_in_window)
 
         if rto_alert:
-            stdscr.addnstr(alert_y, 0, rto_alert[:max_x], max_x)
+            safe_addnstr(stdscr, alert_y, 0, rto_alert, max_y, max_x)
             alert_y += 1
 
     # Traceroute section
@@ -1115,12 +1141,12 @@ def draw_ui(stdscr, state: MonitorState):
         else:
             tr_header = header_base
 
-        stdscr.addnstr(traceroute_header_y, 0, tr_header[:max_x], max_x)
+        safe_addnstr(stdscr, traceroute_header_y, 0, tr_header, max_y, max_x)
 
     # Optional final summary (after traceroute completes)
     summary_y = traceroute_header_y + 1
     if (not traceroute_running) and traceroute_summary and summary_y < max_y:
-        stdscr.addnstr(summary_y, 0, traceroute_summary[:max_x], max_x)
+        safe_addnstr(stdscr, summary_y, 0, traceroute_summary, max_y, max_x)
         start_y = summary_y + 1
     else:
         start_y = summary_y
@@ -1160,14 +1186,14 @@ def draw_ui(stdscr, state: MonitorState):
         visible_lines = base_lines[offset: offset + available_lines]
 
         for i, line in enumerate(visible_lines):
-            stdscr.addnstr(start_y + i, 0, line[:max_x], max_x)
+            safe_addnstr(stdscr, start_y + i, 0, line, max_y, max_x)
 
         # If there was an error, show it at the bottom
         if traceroute_error and available_lines > len(visible_lines):
             y = start_y + len(visible_lines)
             if y < max_y:
                 err_text = tr("TRACE_ERROR_PREFIX", error=traceroute_error)
-                stdscr.addnstr(y, 0, err_text[:max_x], max_x)
+                safe_addnstr(stdscr, y, 0, err_text, max_y, max_x)
 
     stdscr.refresh()
 
