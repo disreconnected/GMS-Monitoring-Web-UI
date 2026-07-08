@@ -9,16 +9,20 @@ import re
 import os
 from collections import deque
 
-try:
-    import curses
-except ImportError:
-    if sys.platform == "win32":
-        sys.stderr.write(
-            "The curses module is required. On Windows install: pip install windows-curses\n"
-        )
-    raise
-
 _WIN32 = sys.platform == "win32"
+
+
+def _import_curses():
+    """Import curses lazily so gms_web_server can import workers without it."""
+    try:
+        import curses
+    except ImportError:
+        if sys.platform == "win32":
+            sys.stderr.write(
+                "The curses module is required. On Windows install: pip install windows-curses\n"
+            )
+        raise
+    return curses
 
 
 def _subprocess_no_window_kwargs():
@@ -108,15 +112,15 @@ def tr(key: str, **kwargs) -> str:
 
 DEFAULT_TARGET_HOST = "www.youtube.com"
 PING_INTERVAL_SECONDS = 1.0
-PING_HISTORY_LENGTH = 300  # how many samples to keep for graphs
-LOSS_HISTORY_LENGTH = 300
+PING_HISTORY_LENGTH = 3600  # how many samples to keep for graphs (~1h at 1Hz)
+LOSS_HISTORY_LENGTH = 3600
 
 MIN_WINDOW_SIZE = 10       # minimum number of recent checks
 DEFAULT_WINDOW_SIZE = 60   # default "time window" in checks (≈ seconds)
 
 # Bandwidth (interface totals → Mbps); anomaly vs rolling median in the same window
 BW_SAMPLE_INTERVAL = 1.0
-BW_HISTORY_LENGTH = 300
+BW_HISTORY_LENGTH = 3600
 BW_WARMUP_SAMPLES = 25
 BW_SPIKE_RATIO = 4.0
 BW_IDLE_BASELINE_MAX_MBPS = 0.25
@@ -580,6 +584,51 @@ def build_traceroute_table(lines: list[str]) -> list[str]:
     return rows
 
 
+def parse_traceroute_hops(lines: list[str]) -> list[dict]:
+    """Structured hop list for web/API consumers."""
+    if not lines:
+        return []
+
+    hop_re = re.compile(r"^\s*(\d+)\s+")
+    ms_re = re.compile(r"([\d.]+)\s*ms")
+    hops: list[dict] = []
+
+    for line in lines:
+        m = hop_re.match(line)
+        if not m:
+            continue
+        hop = int(m.group(1))
+        rest = line[m.end():].strip()
+
+        host = "?"
+        ip = ""
+        if "(" in rest and ")" in rest:
+            before, after = rest.split("(", 1)
+            host = before.strip() or "?"
+            ip = after.split(")", 1)[0].strip()
+        else:
+            host, ip = _tracert_style_host_ip(rest)
+
+        rtts: list[float] = []
+        for ms_match in ms_re.finditer(line):
+            try:
+                rtts.append(float(ms_match.group(1)))
+            except ValueError:
+                continue
+
+        hops.append(
+            {
+                "hop": hop,
+                "host": host,
+                "ip": ip,
+                "ms": rtts,
+                "timeout": len(rtts) == 0,
+            }
+        )
+
+    return hops
+
+
 def traceroute_worker(state: MonitorState):
     """Run traceroute and stream output lines into state.traceroute_lines.
 
@@ -760,6 +809,7 @@ def safe_addnstr(stdscr, y: int, x: int, text: str, max_y: int, max_x: int) -> N
     curses raises ERR when a write would occupy the lower-right cell (y == max_y - 1
     and the last column). Clip width on the bottom row and ignore out-of-bounds coords.
     """
+    curses = _import_curses()
     if not text or max_y <= 0 or max_x <= 0 or y < 0 or x < 0 or y >= max_y or x >= max_x:
         return
     width = max_x - x
@@ -777,6 +827,7 @@ def safe_addnstr(stdscr, y: int, x: int, text: str, max_y: int, max_x: int) -> N
 
 
 def draw_ui(stdscr, state: MonitorState):
+    curses = _import_curses()
     stdscr.clear()
     max_y, max_x = stdscr.getmaxyx()
 
@@ -1199,6 +1250,7 @@ def draw_ui(stdscr, state: MonitorState):
 
 
 def main(stdscr, target_host: str):
+    curses = _import_curses()
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(200)  # getch timeout in ms
@@ -1333,4 +1385,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     set_language(args.lang)
+    curses = _import_curses()
     curses.wrapper(lambda stdscr: main(stdscr, target_host=args.host))
