@@ -8,6 +8,7 @@ type TopBarProps = {
   status: ConnectionStatus;
   view: AppView;
   theme: Theme;
+  controlsEnabled: boolean;
   onViewChange: (view: AppView) => void;
   onThemeToggle: () => void;
   onPause: () => void;
@@ -15,13 +16,36 @@ type TopBarProps = {
   onStop: () => void;
 };
 
-function qualityClass(quality: string): string {
-  const q = quality.toLowerCase();
-  if (q.includes("excellent")) return "bg-accent/20 text-accent border-accent/30";
-  if (q.includes("good")) return "bg-emerald-500/20 text-emerald-400 border-emerald-500/30";
-  if (q.includes("fair")) return "bg-warning/20 text-warning border-warning/30";
-  if (q.includes("poor")) return "bg-danger/20 text-danger border-danger/30";
-  return "bg-surface text-fg-muted border-edge";
+function qualityClass(code: MonitorSnapshot["quality_code"] | undefined): string {
+  switch (code) {
+    case "excellent":
+      return "bg-accent/20 text-accent border-accent/30";
+    case "good":
+      return "bg-emerald-500/20 text-emerald-400 border-emerald-500/30";
+    case "fair":
+      return "bg-warning/20 text-warning border-warning/30";
+    case "poor":
+      return "bg-danger/20 text-danger border-danger/30";
+    default:
+      return "bg-surface text-fg-muted border-edge";
+  }
+}
+
+function statusLabel(status: ConnectionStatus): string {
+  switch (status) {
+    case "connected":
+      return "Live";
+    case "connecting":
+      return "Connecting";
+    case "auth_error":
+      return "Unauthorized";
+    case "origin_error":
+      return "Origin blocked";
+    case "client_limit":
+      return "Client limit";
+    default:
+      return "Offline";
+  }
 }
 
 export function TopBar({
@@ -29,6 +53,7 @@ export function TopBar({
   status,
   view,
   theme,
+  controlsEnabled,
   onViewChange,
   onThemeToggle,
   onPause,
@@ -38,6 +63,7 @@ export function TopBar({
   const paused = snapshot?.paused ?? false;
   const host = snapshot?.host ?? "connecting...";
   const quality = snapshot?.quality ?? "Unknown";
+  const qualityCode = snapshot?.quality_code;
 
   const handleStop = () => {
     if (window.confirm("Stop the GMS monitoring web server?")) {
@@ -86,7 +112,7 @@ export function TopBar({
           </div>
 
           <span
-            className={`hidden rounded-full border px-2.5 py-1 text-xs font-medium lg:inline ${qualityClass(quality)}`}
+            className={`hidden rounded-full border px-2.5 py-1 text-xs font-medium lg:inline ${qualityClass(qualityCode)}`}
           >
             {quality}
           </span>
@@ -97,14 +123,13 @@ export function TopBar({
             ) : (
               <WifiSlash size={12} className="text-warning" />
             )}
-            <span className="hidden md:inline">
-              {status === "connected" ? "Live" : status === "connecting" ? "Connecting" : "Offline"}
-            </span>
+            <span className="hidden md:inline">{statusLabel(status)}</span>
           </span>
 
           <ThemeToggle theme={theme} onToggle={onThemeToggle} />
 
           {view === "live" &&
+            controlsEnabled &&
             (paused ? (
               <button
                 type="button"
@@ -130,7 +155,8 @@ export function TopBar({
           <button
             type="button"
             onClick={handleStop}
-            className="inline-flex items-center gap-1 rounded-full border border-danger/30 bg-danger/10 px-2.5 py-1.5 text-xs font-medium text-danger transition active:scale-[0.98] md:gap-2 md:px-3 md:py-2 md:text-sm"
+            disabled={!controlsEnabled}
+            className="inline-flex items-center gap-1 rounded-full border border-danger/30 bg-danger/10 px-2.5 py-1.5 text-xs font-medium text-danger transition active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 md:gap-2 md:px-3 md:py-2 md:text-sm"
           >
             <Stop size={14} weight="fill" className="md:hidden" />
             <Stop size={16} weight="fill" className="hidden md:block" />

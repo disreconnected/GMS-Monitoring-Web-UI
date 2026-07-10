@@ -1,6 +1,11 @@
 # Python bytecode cache
 __pycache__/
 *.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+*.log
 
 # Frontend
 web/node_modules/

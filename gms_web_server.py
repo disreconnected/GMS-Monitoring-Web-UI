@@ -36,6 +36,7 @@ from gms_monitor import (
     set_language,
     traceroute_worker,
     tr,
+    validate_target_host,
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -47,6 +48,23 @@ VALID_WS_ACTIONS = frozenset({"pause", "resume", "traceroute", "set_window"})
 TRACEROUTE_COOLDOWN_SECONDS = 10.0
 DEFAULT_MAX_WS_CLIENTS = 5
 TOKEN_HEADER = "x-gms-token"
+WS_APP_PROTOCOL = "gms-monitoring"
+WS_TOKEN_PREFIX = "gms-token."
+
+
+def extract_ws_token(websocket: WebSocket) -> str | None:
+    header = websocket.headers.get("sec-websocket-protocol", "")
+    for part in header.split(","):
+        candidate = part.strip()
+        if candidate.startswith(WS_TOKEN_PREFIX):
+            return candidate[len(WS_TOKEN_PREFIX) :]
+    return None
+
+
+def _normalize_origin_host(host: str) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
 
 
 def is_loopback_address(addr: str | None) -> bool:
@@ -92,6 +110,7 @@ class ServerSecurity:
         self.max_ws_clients = max(1, max_ws_clients)
         self.traceroute_cooldown = traceroute_cooldown
         self._ws_lock = threading.Lock()
+        self._traceroute_lock = threading.Lock()
         self._ws_clients = 0
         self._last_traceroute_request = 0.0
 
@@ -112,8 +131,9 @@ class ServerSecurity:
         if self.bind in {"0.0.0.0", "::"}:
             display_hosts.update({"localhost", "127.0.0.1"})
         for host in display_hosts:
+            normalized = _normalize_origin_host(host)
             for scheme in ("http", "https"):
-                origins.add(f"{scheme}://{host}:{self.port}")
+                origins.add(f"{scheme}://{normalized}:{self.port}")
         return origins
 
     def verify_token(self, token: str | None) -> bool:
@@ -146,11 +166,12 @@ class ServerSecurity:
             self._ws_clients = max(0, self._ws_clients - 1)
 
     def can_trigger_traceroute(self) -> bool:
-        now = time.time()
-        if now - self._last_traceroute_request < self.traceroute_cooldown:
-            return False
-        self._last_traceroute_request = now
-        return True
+        with self._traceroute_lock:
+            now = time.time()
+            if now - self._last_traceroute_request < self.traceroute_cooldown:
+                return False
+            self._last_traceroute_request = now
+            return True
 
     def dashboard_url(self) -> str:
         host = "127.0.0.1" if self.bind in {"0.0.0.0", "::"} else self.bind
@@ -192,7 +213,7 @@ def handle_ws_action(monitor: "MonitorService", security: ServerSecurity, msg: o
         monitor.set_window_size(size)
 
 
-def _quality_label(
+def _quality_code(
     recent_count: int,
     window_size: int,
     recent_loss_pct: float,
@@ -200,14 +221,34 @@ def _quality_label(
     jitter_ms: float | None,
 ) -> str:
     if recent_count < max(20, window_size // 2) or recent_avg_ping is None:
-        return tr("QUALITY_UNKNOWN")
+        return "unknown"
     if recent_loss_pct < 1.0 and recent_avg_ping < 40 and (jitter_ms is None or jitter_ms < 5):
-        return tr("QUALITY_EXCELLENT")
+        return "excellent"
     if recent_loss_pct < 2.0 and recent_avg_ping < 80:
-        return tr("QUALITY_GOOD")
+        return "good"
     if recent_loss_pct < 5.0 and recent_avg_ping < 150:
-        return tr("QUALITY_FAIR")
-    return tr("QUALITY_POOR")
+        return "fair"
+    return "poor"
+
+
+def _quality_label(
+    recent_count: int,
+    window_size: int,
+    recent_loss_pct: float,
+    recent_avg_ping: float | None,
+    jitter_ms: float | None,
+) -> str:
+    code = _quality_code(
+        recent_count, window_size, recent_loss_pct, recent_avg_ping, jitter_ms
+    )
+    key_map = {
+        "unknown": "QUALITY_UNKNOWN",
+        "excellent": "QUALITY_EXCELLENT",
+        "good": "QUALITY_GOOD",
+        "fair": "QUALITY_FAIR",
+        "poor": "QUALITY_POOR",
+    }
+    return tr(key_map[code])
 
 
 def _build_stats_block(
@@ -341,6 +382,7 @@ def build_snapshot(state: MonitorState, monitor: "MonitorService | None" = None)
         last_ping_ms = state.last_ping_ms
         window_size = state.window_size
         ping_history = list(state.ping_history)
+        ping_timestamps = list(state.ping_timestamps)
         total_sent = state.total_sent
         total_recv = state.total_recv
         total_success = state.total_success
@@ -349,6 +391,7 @@ def build_snapshot(state: MonitorState, monitor: "MonitorService | None" = None)
         jitter_count_all = state.jitter_count_all
         bw_rx_hist = list(state.bw_rx_mbps_history)
         bw_tx_hist = list(state.bw_tx_mbps_history)
+        bw_timestamps = list(state.bw_timestamps)
         bw_last_error = state.bw_last_error
         traceroute_lines = list(state.traceroute_lines)
         traceroute_running = state.traceroute_running
@@ -384,22 +427,22 @@ def build_snapshot(state: MonitorState, monitor: "MonitorService | None" = None)
 
     now = time.time()
     ping_history_out = []
-    base_t = now - len(ping_history)
     for i, val in enumerate(ping_history):
+        sample_t = ping_timestamps[i] if i < len(ping_timestamps) else now
         ping_history_out.append(
             {
-                "t": base_t + i,
+                "t": sample_t,
                 "ms": round(val, 2) if val is not None else None,
                 "ok": val is not None,
             }
         )
 
     bw_history = []
-    base_bw = now - len(bw_rx_hist)
     for i in range(len(bw_rx_hist)):
+        sample_t = bw_timestamps[i] if i < len(bw_timestamps) else now
         bw_history.append(
             {
-                "t": base_bw + i,
+                "t": sample_t,
                 "rx_mbps": round(bw_rx_hist[i], 2),
                 "tx_mbps": round(bw_tx_hist[i], 2) if i < len(bw_tx_hist) else 0.0,
             }
@@ -420,6 +463,9 @@ def build_snapshot(state: MonitorState, monitor: "MonitorService | None" = None)
         "timestamp": now,
         "current_ping": round(last_ping_ms, 2) if last_ping_ms is not None else None,
         "quality": _quality_label(
+            recent_count, window_size, recent_loss_pct, recent_avg_ping, jitter_ms
+        ),
+        "quality_code": _quality_code(
             recent_count, window_size, recent_loss_pct, recent_avg_ping, jitter_ms
         ),
         "paused": not monitoring,
@@ -464,24 +510,26 @@ def build_snapshot(state: MonitorState, monitor: "MonitorService | None" = None)
 
 class MonitorService:
     def __init__(self, target_host: str):
-        self.state = MonitorState(target_host)
+        self.state = MonitorState(validate_target_host(target_host))
         self._threads: list[threading.Thread] = []
         self.started_at = time.time()
         self.alert_log: deque = deque(maxlen=50)
         self._previously_active: set[str] = set()
+        self._alert_lock = threading.Lock()
 
     def update_alert_log(self, alerts: list[dict]) -> None:
-        current_msgs = {a["msg"] for a in alerts}
-        for alert in alerts:
-            if alert["msg"] not in self._previously_active:
-                self.alert_log.appendleft(
-                    {
-                        "time": alert["time"],
-                        "level": alert["level"],
-                        "msg": alert["msg"],
-                    }
-                )
-        self._previously_active = current_msgs
+        with self._alert_lock:
+            current_msgs = {a["msg"] for a in alerts}
+            for alert in alerts:
+                if alert["msg"] not in self._previously_active:
+                    self.alert_log.appendleft(
+                        {
+                            "time": alert["time"],
+                            "level": alert["level"],
+                            "msg": alert["msg"],
+                        }
+                    )
+            self._previously_active = current_msgs
 
     def start(self) -> None:
         self._threads = [
@@ -541,20 +589,21 @@ def create_app(monitor: MonitorService, security: ServerSecurity) -> FastAPI:
                 status_code=403,
             )
 
+        monitor.stop()
         server = getattr(app.state, "server", None)
 
         def _stop() -> None:
             if server is not None:
                 server.should_exit = True
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.call_later(0.3, _stop)
         return JSONResponse({"status": "stopping"})
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
         origin = websocket.headers.get("origin")
-        token = websocket.query_params.get("token")
+        token = extract_ws_token(websocket)
         client_host = websocket.client.host if websocket.client else None
 
         if not security.verify_token(token):
@@ -573,7 +622,7 @@ def create_app(monitor: MonitorService, security: ServerSecurity) -> FastAPI:
             await websocket.close(code=1008, reason="Too many clients")
             return
 
-        await websocket.accept()
+        await websocket.accept(subprotocol=WS_APP_PROTOCOL)
         try:
             while True:
                 snapshot = build_snapshot(monitor.state, monitor)
@@ -659,6 +708,10 @@ def main() -> None:
     args = parser.parse_args()
 
     validate_bind_address(args.bind, args.allow_remote)
+    try:
+        target_host = validate_target_host(args.host)
+    except ValueError as exc:
+        parser.error(str(exc))
     security = ServerSecurity(
         args.bind,
         args.port,
@@ -670,7 +723,7 @@ def main() -> None:
     security.print_startup_banner()
 
     set_language(args.lang)
-    monitor = MonitorService(args.host)
+    monitor = MonitorService(target_host)
     monitor.start()
     app = create_app(monitor, security)
 

@@ -54,6 +54,7 @@ export type MonitorSnapshot = {
   timestamp: number;
   current_ping: number | null;
   quality: string;
+  quality_code: "unknown" | "excellent" | "good" | "fair" | "poor";
   paused: boolean;
   window_size: number;
   window_stats: StatsBlock & { session: SessionStats };
@@ -79,6 +80,12 @@ export type MonitorSnapshot = {
   session: SessionInfo;
 };
 
-export type ConnectionStatus = "connecting" | "connected" | "disconnected" | "auth_error";
+export type ConnectionStatus =
+  | "connecting"
+  | "connected"
+  | "disconnected"
+  | "auth_error"
+  | "origin_error"
+  | "client_limit";
 
 export type AppView = "live" | "report";

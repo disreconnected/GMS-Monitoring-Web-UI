@@ -3,6 +3,7 @@ import { RecentPingsTable } from "./RecentPingsTable";
 
 type ReportViewProps = {
   snapshot: MonitorSnapshot | null;
+  isStale: boolean;
 };
 
 function formatTime(t: number) {
@@ -20,13 +21,19 @@ function formatUptime(seconds: number): string {
   return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
-function qualityClass(quality: string): string {
-  const q = quality.toLowerCase();
-  if (q.includes("excellent")) return "bg-accent/20 text-accent border-accent/30";
-  if (q.includes("good")) return "bg-emerald-500/20 text-emerald-600 border-emerald-500/30";
-  if (q.includes("fair")) return "bg-warning/20 text-warning border-warning/30";
-  if (q.includes("poor")) return "bg-danger/20 text-danger border-danger/30";
-  return "bg-surface text-fg-muted border-edge";
+function qualityClass(code: MonitorSnapshot["quality_code"] | undefined): string {
+  switch (code) {
+    case "excellent":
+      return "bg-accent/20 text-accent border-accent/30";
+    case "good":
+      return "bg-emerald-500/20 text-emerald-600 border-emerald-500/30";
+    case "fair":
+      return "bg-warning/20 text-warning border-warning/30";
+    case "poor":
+      return "bg-danger/20 text-danger border-danger/30";
+    default:
+      return "bg-surface text-fg-muted border-edge";
+  }
 }
 
 function hopLabel(hop: { host: string; ip: string }) {
@@ -41,7 +48,7 @@ function levelClass(level: string): string {
   return "text-accent";
 }
 
-export function ReportView({ snapshot }: ReportViewProps) {
+export function ReportView({ snapshot, isStale }: ReportViewProps) {
   if (!snapshot) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center bg-bg text-fg-muted">
@@ -50,7 +57,7 @@ export function ReportView({ snapshot }: ReportViewProps) {
     );
   }
 
-  const hops = snapshot.traceroute.hops;
+  const hops = snapshot.traceroute?.hops ?? [];
   const recentAlerts = snapshot.alert_log.slice(0, 5);
   const session = snapshot.session;
 
@@ -64,10 +71,15 @@ export function ReportView({ snapshot }: ReportViewProps) {
         </div>
         <div className="flex items-center gap-2 md:gap-3">
           <span
-            className={`rounded-full border px-2 py-0.5 text-xs font-medium ${qualityClass(snapshot.quality)}`}
+            className={`rounded-full border px-2 py-0.5 text-xs font-medium ${qualityClass(snapshot.quality_code)}`}
           >
             {snapshot.quality}
           </span>
+          {isStale && (
+            <span className="rounded-full border border-warning/30 bg-warning/10 px-2 py-0.5 text-xs text-warning">
+              Stale
+            </span>
+          )}
           <div className="text-right">
             <p className="font-mono text-[10px] text-fg-muted md:text-xs">
               As of {formatTime(snapshot.timestamp)}

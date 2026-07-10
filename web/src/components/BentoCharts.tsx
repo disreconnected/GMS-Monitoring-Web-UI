@@ -51,6 +51,7 @@ type BandwidthBucket = {
 
 type BentoChartsProps = {
   snapshot: MonitorSnapshot | null;
+  isStale?: boolean;
 };
 
 function formatTime(t: number) {
@@ -69,24 +70,32 @@ function bucketLatency(
   points: MonitorSnapshot["ping_history"],
   scaleSeconds: number,
 ): LatencyBucket[] {
-  const buckets = new Map<number, number>();
+  const buckets = new Map<number, { ms: number | null; hadTimeout: boolean }>();
   for (const point of points) {
-    if (point.ms === null) continue;
     const start = bucketStart(point.t, scaleSeconds);
-    const current = buckets.get(start);
-    if (current === undefined || point.ms > current) {
-      buckets.set(start, point.ms);
+    const current = buckets.get(start) ?? { ms: null, hadTimeout: false };
+    if (point.ms === null) {
+      buckets.set(start, { ms: current.ms, hadTimeout: true });
+      continue;
     }
+    const nextMs =
+      current.ms === null ? point.ms : Math.max(current.ms, point.ms);
+    buckets.set(start, { ms: nextMs, hadTimeout: current.hadTimeout });
   }
 
   return [...buckets.entries()]
     .sort(([a], [b]) => a - b)
-    .map(([t, msReal]) => ({
+    .map(([t, bucket]) => ({
       t,
       label: formatTime(t),
-      msReal,
-      msDisplay: Math.min(msReal, 150),
-      spikeLabel: msReal > 150 ? `${Math.round(msReal)}ms` : "",
+      msReal: bucket.ms,
+      msDisplay: bucket.ms === null ? null : Math.min(bucket.ms, 150),
+      spikeLabel:
+        bucket.hadTimeout && bucket.ms === null
+          ? "timeout"
+          : bucket.ms !== null && bucket.ms > 150
+            ? `${Math.round(bucket.ms)}ms`
+            : "",
     }));
 }
 
@@ -278,19 +287,15 @@ function BandwidthChart({
   const colors = getChartColors();
 
   const { data, avgRx, avgTx } = useMemo(() => {
-    const raw: BandwidthPoint[] = snapshot?.bandwidth.history ?? [];
+    const raw: BandwidthPoint[] = snapshot?.bandwidth?.history ?? [];
     const chartData =
       scale === "live" ? liveBandwidth(raw) : bucketBandwidth(raw, SCALE_SECONDS[scale]);
-    const avgRxVal =
-      chartData.length > 0
-        ? chartData.reduce((s, p) => s + p.rx, 0) / chartData.length
-        : 0;
-    const avgTxVal =
-      chartData.length > 0
-        ? chartData.reduce((s, p) => s + p.tx, 0) / chartData.length
-        : 0;
-    return { data: chartData, avgRx: avgRxVal, avgTx: avgTxVal };
-  }, [snapshot?.bandwidth.history, scale]);
+    return {
+      data: chartData,
+      avgRx: snapshot?.bandwidth?.avg_rx_mbps ?? 0,
+      avgTx: snapshot?.bandwidth?.avg_tx_mbps ?? 0,
+    };
+  }, [snapshot?.bandwidth, scale]);
 
   useEffect(() => {
     const el = ref.current;

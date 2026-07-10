@@ -1,15 +1,21 @@
 import { AnimatedNumber } from "./AnimatedNumber";
-import type { MonitorSnapshot } from "../types/monitor";
+import type { ConnectionStatus, MonitorSnapshot } from "../types/monitor";
 
 type HeroSectionProps = {
   snapshot: MonitorSnapshot | null;
+  status: ConnectionStatus;
+  isStale: boolean;
 };
 
-export function HeroSection({ snapshot }: HeroSectionProps) {
+export function HeroSection({ snapshot, status, isStale }: HeroSectionProps) {
   const ping = snapshot?.current_ping ?? null;
   const quality = snapshot?.quality ?? "Unknown";
   const host = snapshot?.host ?? "waiting for target";
   const paused = snapshot?.paused ?? false;
+
+  let statusLine = "Updating every second";
+  if (paused) statusLine = "Monitoring paused";
+  else if (status !== "connected" || isStale) statusLine = "Waiting for live data...";
 
   return (
     <section className="relative flex min-h-[100dvh] items-center justify-center overflow-hidden px-4 pb-24 pt-20">
@@ -32,9 +38,7 @@ export function HeroSection({ snapshot }: HeroSectionProps) {
         </div>
 
         <p className="mt-6 text-lg text-fg md:text-xl">{quality}</p>
-        <p className="mt-2 text-sm text-fg-muted">
-          {paused ? "Monitoring paused" : "Updating every second"}
-        </p>
+        <p className="mt-2 text-sm text-fg-muted">{statusLine}</p>
       </div>
     </section>
   );

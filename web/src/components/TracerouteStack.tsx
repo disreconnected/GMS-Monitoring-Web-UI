@@ -3,6 +3,7 @@ import type { MonitorSnapshot } from "../types/monitor";
 
 type TracerouteStackProps = {
   snapshot: MonitorSnapshot | null;
+  controlsEnabled: boolean;
   onRerun: () => void;
 };
 
@@ -12,9 +13,9 @@ function hopLabel(hop: { host: string; ip: string }) {
   return hop.host;
 }
 
-export function TracerouteStack({ snapshot, onRerun }: TracerouteStackProps) {
-  const hops = [...(snapshot?.traceroute.hops ?? [])].sort((a, b) => b.hop - a.hop);
-  const running = snapshot?.traceroute.running ?? false;
+export function TracerouteStack({ snapshot, controlsEnabled, onRerun }: TracerouteStackProps) {
+  const hops = [...(snapshot?.traceroute?.hops ?? [])].sort((a, b) => b.hop - a.hop);
+  const running = snapshot?.traceroute?.running ?? false;
 
   return (
     <section className="px-4 py-12 md:px-8">
@@ -24,18 +25,18 @@ export function TracerouteStack({ snapshot, onRerun }: TracerouteStackProps) {
           <p className="mt-2 max-w-md text-sm text-fg-muted">
             {running
               ? "Traceroute is running..."
-              : snapshot?.traceroute.summary || "Hop-by-hop route to the monitored target."}
+              : snapshot?.traceroute?.summary || "Hop-by-hop route to the monitored target."}
           </p>
           <button
             type="button"
             onClick={onRerun}
-            disabled={running}
+            disabled={running || !controlsEnabled}
             className="mt-4 inline-flex items-center gap-2 rounded-full bg-accent px-4 py-2 text-sm font-medium text-white transition active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
           >
             <ArrowClockwise size={16} />
             Re-run
           </button>
-          {snapshot?.traceroute.error && (
+          {snapshot?.traceroute?.error && (
             <p className="mt-3 text-sm text-danger">{snapshot.traceroute.error}</p>
           )}
         </div>

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import queue
 import statistics
 import threading
 import subprocess
@@ -8,6 +9,33 @@ import time
 import re
 import os
 from collections import deque
+from ipaddress import ip_address
+
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+    r"(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*\.?$"
+)
+
+
+def validate_target_host(host: str) -> str:
+    """Validate monitor target before passing to subprocess probes."""
+    candidate = host.strip()
+    if not candidate:
+        raise ValueError("Target host cannot be empty")
+    if candidate.startswith("-"):
+        raise ValueError("Target host cannot start with '-'")
+    if any(ch.isspace() or ord(ch) < 32 for ch in candidate):
+        raise ValueError("Target host contains invalid characters")
+    if "://" in candidate or "/" in candidate or "\\" in candidate:
+        raise ValueError("Target host must be a hostname or IP, not a URL")
+    try:
+        ip_address(candidate)
+        return candidate
+    except ValueError:
+        pass
+    if _HOSTNAME_RE.match(candidate):
+        return candidate
+    raise ValueError(f"Invalid target host: {candidate!r}")
 
 _WIN32 = sys.platform == "win32"
 
@@ -134,7 +162,7 @@ class MonitorState:
         self.lock = threading.Lock()
 
         # Target being monitored (host name or IP address)
-        self.target_host = target_host
+        self.target_host = validate_target_host(target_host)
 
         # Control flags
         self.running = True          # overall program running
@@ -159,6 +187,7 @@ class MonitorState:
 
         # History
         self.ping_history = deque(maxlen=PING_HISTORY_LENGTH)  # float ms or None for loss
+        self.ping_timestamps = deque(maxlen=PING_HISTORY_LENGTH)
         self.loss_history = deque(maxlen=LOSS_HISTORY_LENGTH)  # float % (overall, for reference)
 
         # Window used for "recent" stats and graphs (in checks)
@@ -181,6 +210,7 @@ class MonitorState:
         # Throughput (all interfaces aggregate), sampled every BW_SAMPLE_INTERVAL
         self.bw_rx_mbps_history = deque(maxlen=BW_HISTORY_LENGTH)
         self.bw_tx_mbps_history = deque(maxlen=BW_HISTORY_LENGTH)
+        self.bw_timestamps = deque(maxlen=BW_HISTORY_LENGTH)
         self.bw_last_error = None
 
 
@@ -239,13 +269,12 @@ def get_net_io_totals() -> tuple[int, int] | None:
         import psutil
 
         io = psutil.net_io_counters(pernic=False)
-        if io is None:
-            return None
-        return int(io.bytes_recv), int(io.bytes_sent)
+        if io is not None:
+            return int(io.bytes_recv), int(io.bytes_sent)
     except ImportError:
         pass
     except Exception:
-        return None
+        pass
 
     if _WIN32:
         return _win_net_totals_powershell()
@@ -285,6 +314,7 @@ def bandwidth_worker(state: MonitorState):
                 with state.lock:
                     state.bw_rx_mbps_history.append(mbps_down)
                     state.bw_tx_mbps_history.append(mbps_up)
+                    state.bw_timestamps.append(now)
         last_rx, last_tx, last_t = rx, tx, now
 
 
@@ -363,12 +393,12 @@ def run_ping(host: str, timeout: float = 5.0):
     # Unix/macOS: time=1.234 ms
     match = re.search(r"time[=<]([\d.]+)\s*ms", out, re.IGNORECASE)
     if not match:
-        return True, None  # success but no RTT parsed
+        return False, None
 
     try:
         rtt = float(match.group(1))
     except ValueError:
-        rtt = None
+        return False, None
     return True, rtt
 
 
@@ -417,6 +447,7 @@ def ping_worker(state: MonitorState, interval: float):
             start_time = time.time()
             success, rtt = run_ping(host)
             elapsed = time.time() - start_time
+            sample_time = time.time()
 
             with state.lock:
                 state.total_sent += 1
@@ -464,6 +495,7 @@ def ping_worker(state: MonitorState, interval: float):
 
                 # For ping history, None == timeout / packet lost
                 state.ping_history.append(rtt if success else None)
+                state.ping_timestamps.append(sample_time)
                 state.loss_history.append(overall_loss_pct)
 
             sleep_time = max(0.0, interval - elapsed)
@@ -668,20 +700,33 @@ def traceroute_worker(state: MonitorState):
     lines = []
     start_time = time.time()
     error_msg = None
+    line_queue: queue.Queue[str | None] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line_queue.put(raw_line.rstrip("\n"))
+        finally:
+            line_queue.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
 
     try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            lines.append(line)
-            with state.lock:
-                state.traceroute_lines = list(lines)
-
-            # Enforce an overall timeout so traceroute cannot hang forever.
+        while True:
             if time.time() - start_time > 300:
                 proc.kill()
                 error_msg = "traceroute timed out after 300 seconds"
                 break
+            try:
+                line = line_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
+            lines.append(line)
+            with state.lock:
+                state.traceroute_lines = list(lines)
 
         # Wait for process to exit (short timeout just for cleanup)
         try:
@@ -1385,5 +1430,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     set_language(args.lang)
+    try:
+        target_host = validate_target_host(args.host)
+    except ValueError as exc:
+        parser.error(str(exc))
     curses = _import_curses()
-    curses.wrapper(lambda stdscr: main(stdscr, target_host=args.host))
+    curses.wrapper(lambda stdscr: main(stdscr, target_host=target_host))

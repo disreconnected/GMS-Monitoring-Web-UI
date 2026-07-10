@@ -6,11 +6,18 @@ import subprocess
 import sys
 import unittest
 
-import curses
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
+
+
+def _import_curses():
+    try:
+        import curses
+    except ImportError:
+        raise unittest.SkipTest("curses is not available on this platform")
+    return curses
+
 
 from gms_monitor import (  # noqa: E402
     MonitorState,
@@ -19,6 +26,7 @@ from gms_monitor import (  # noqa: E402
     run_ping,
     safe_addnstr,
     set_language,
+    validate_target_host,
 )
 
 
@@ -74,6 +82,7 @@ def _stress_state() -> MonitorState:
 
 class SafeAddnstrTests(unittest.TestCase):
     def test_bottom_row_avoids_lower_right_corner(self):
+        curses = _import_curses()
         screen = _MockScreen(25, 80)
         long_line = "x" * 80
         safe_addnstr(screen, 24, 0, long_line, 25, 80)
@@ -83,6 +92,10 @@ class SafeAddnstrTests(unittest.TestCase):
         self.assertLess(x + n, 80)
 
     def test_out_of_bounds_is_ignored(self):
+        try:
+            _import_curses()
+        except unittest.SkipTest:
+            self.skipTest("curses is not available on this platform")
         screen = _MockScreen(10, 40)
         safe_addnstr(screen, 10, 0, "overflow", 10, 40)
         self.assertEqual(screen.writes, [])
@@ -90,6 +103,10 @@ class SafeAddnstrTests(unittest.TestCase):
 
 class DrawUiTests(unittest.TestCase):
     def test_draw_ui_small_and_default_terminals(self):
+        try:
+            _import_curses()
+        except unittest.SkipTest:
+            self.skipTest("curses is not available on this platform")
         state = _stress_state()
         for rows, cols in ((24, 80), (30, 100), (45, 120)):
             with self.subTest(rows=rows, cols=cols):
@@ -117,6 +134,7 @@ class BatLauncherTests(unittest.TestCase):
             cwd=SCRIPT_DIR,
             capture_output=True,
             text=True,
+            timeout=120,
         )
         if proc.returncode != 0:
             sys.stderr.write(proc.stdout)
@@ -133,6 +151,16 @@ class StatsTests(unittest.TestCase):
         self.assertAlmostEqual(loss, 25.0)
         self.assertAlmostEqual(avg, 20.0)
         self.assertIsNotNone(jitter)
+
+
+class HostValidationTests(unittest.TestCase):
+    def test_accepts_valid_hosts(self) -> None:
+        self.assertEqual(validate_target_host("www.youtube.com"), "www.youtube.com")
+        self.assertEqual(validate_target_host("127.0.0.1"), "127.0.0.1")
+
+    def test_rejects_option_like_hosts(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_target_host("-t")
 
 
 if __name__ == "__main__":

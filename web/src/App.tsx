@@ -9,6 +9,7 @@ import { RecentPingsTable } from "./components/RecentPingsTable";
 import { SessionDetailPanel } from "./components/SessionDetailPanel";
 import { AlertHistoryPanel } from "./components/AlertHistoryPanel";
 import { ReportView } from "./components/ReportView";
+import { TokenEntryPanel } from "./components/TokenEntryPanel";
 import { useMonitorSocket } from "./hooks/useMonitorSocket";
 import { useTheme } from "./hooks/useTheme";
 import type { AppView } from "./types/monitor";
@@ -67,51 +68,74 @@ function StoppedOverlay() {
 }
 
 export default function App() {
-  const { snapshot, status, stopped, pause, resume, rerunTraceroute, stopServer } =
-    useMonitorSocket();
+  const {
+    snapshot,
+    status,
+    stopped,
+    isStale,
+    lastUpdatedAt,
+    shutdownError,
+    needsToken,
+    pause,
+    resume,
+    rerunTraceroute,
+    stopServer,
+    submitToken,
+  } = useMonitorSocket();
   const { theme, toggleTheme } = useTheme();
   const [view, setView] = useState<AppView>("live");
+  const controlsEnabled = status === "connected";
+
+  if (needsToken) {
+    return <TokenEntryPanel onSubmit={submitToken} />;
+  }
 
   if (stopped) {
     return <StoppedOverlay />;
   }
 
+  const topBar = (
+    <TopBar
+      snapshot={snapshot}
+      status={status}
+      view={view}
+      theme={theme}
+      controlsEnabled={controlsEnabled}
+      onViewChange={setView}
+      onThemeToggle={toggleTheme}
+      onPause={pause}
+      onResume={resume}
+      onStop={stopServer}
+    />
+  );
+
   if (view === "report") {
     return (
       <main className="flex h-[100dvh] w-full max-w-full flex-col overflow-hidden bg-bg text-fg">
-        <TopBar
-          snapshot={snapshot}
+        {topBar}
+        <DisconnectedBanner
           status={status}
-          view={view}
-          theme={theme}
-          onViewChange={setView}
-          onThemeToggle={toggleTheme}
-          onPause={pause}
-          onResume={resume}
-          onStop={stopServer}
+          isStale={isStale}
+          lastUpdatedAt={lastUpdatedAt}
+          shutdownError={shutdownError}
         />
-        <ReportView snapshot={snapshot} />
+        <ReportView snapshot={snapshot} isStale={isStale} />
       </main>
     );
   }
 
   return (
     <main className="overflow-x-hidden w-full max-w-full bg-bg text-fg">
-      <TopBar
-        snapshot={snapshot}
+      {topBar}
+      <DisconnectedBanner
         status={status}
-        view={view}
-        theme={theme}
-        onViewChange={setView}
-        onThemeToggle={toggleTheme}
-        onPause={pause}
-        onResume={resume}
-        onStop={stopServer}
+        isStale={isStale}
+        lastUpdatedAt={lastUpdatedAt}
+        shutdownError={shutdownError}
       />
-      <DisconnectedBanner status={status} />
-      <HeroSection snapshot={snapshot} />
+      <HeroSection snapshot={snapshot} status={status} isStale={isStale} />
       <AlertTicker alerts={snapshot?.alerts ?? []} />
-      <BentoCharts snapshot={snapshot} />
+      <BentoCharts snapshot={snapshot} isStale={isStale} />
       <section className="px-4 py-12 md:px-8">
         <div className="mx-auto grid max-w-7xl grid-cols-1 gap-4 md:grid-cols-2">
           <RecentPingsTable pingHistory={snapshot?.ping_history ?? []} />
@@ -123,7 +147,11 @@ export default function App() {
           <AlertHistoryPanel alertLog={snapshot?.alert_log ?? []} />
         </div>
       </section>
-      <TracerouteStack snapshot={snapshot} onRerun={rerunTraceroute} />
+      <TracerouteStack
+        snapshot={snapshot}
+        controlsEnabled={controlsEnabled}
+        onRerun={rerunTraceroute}
+      />
       <StatusFooter snapshot={snapshot} />
     </main>
   );

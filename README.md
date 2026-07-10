@@ -24,7 +24,7 @@ Default monitor target: `www.youtube.com` (configurable).
 | **Controls** | Pause / resume monitoring, re-run traceroute, stop server |
 | **Security** | Per-run access token, authenticated WebSocket/shutdown, loopback-only by default |
 | **Theme** | Light / dark toggle (persisted in browser) |
-| **Languages** | English and Indonesian (`--lang en` / `--lang id`) |
+| **Languages** | Server-generated strings only (`--lang en` / `--lang id`); UI chrome is English |
 
 ### Core monitoring (shared with TUI)
 
@@ -198,7 +198,7 @@ gmsmonitoring/
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/` | GET | — | Serves the React app (when `web/dist` exists) |
-| `/ws?token=...` | WebSocket | `token` query param + allowed `Origin` (or loopback client in local mode) | Live monitor snapshots (~1 Hz); accepts control JSON |
+| `/ws` | WebSocket | `Sec-WebSocket-Protocol` token + allowed `Origin` (or loopback client in local mode) | Live monitor snapshots (~1 Hz); accepts control JSON |
 | `/api/shutdown` | POST | `X-GMS-Token` header + loopback client | Gracefully stops the uvicorn server |
 
 ### WebSocket control messages
@@ -222,7 +222,7 @@ The web server is a **local monitoring tool** with a per-run control token and a
 
 | Area | Protection |
 |------|------------|
-| **WebSocket `/ws`** | Requires valid per-run token; validates browser `Origin` (with loopback fallback for embedded browsers) |
+| **WebSocket `/ws`** | Requires valid per-run token via `Sec-WebSocket-Protocol`; validates browser `Origin` (with loopback fallback for embedded browsers) |
 | **Shutdown `/api/shutdown`** | Requires `X-GMS-Token` header; loopback-only in local mode |
 | **Network bind** | Non-loopback addresses blocked unless `--allow-remote` + `--access-token` |
 | **Control commands** | Input validation, traceroute throttle (10 s), max 5 WebSocket clients |
@@ -235,9 +235,10 @@ The web server is a **local monitoring tool** with a per-run control token and a
 - Generates a random **access token** on each startup.
 - Prints a secure dashboard URL: `http://127.0.0.1:8765/#token=<token>`
 - The token lives in the URL **fragment** (not sent in HTTP requests or server logs).
-- The React client reads the fragment once, keeps the token in memory, and sends it as:
-  - WebSocket query param: `/ws?token=...`
+- The React client reads the fragment once, stores it in **sessionStorage** for the current tab, and sends it as:
+  - WebSocket subprotocol: `gms-token.<token>` (negotiated with `gms-monitoring`)
   - HTTP header for shutdown: `X-GMS-Token`
+- If the token is missing or rejected, the dashboard shows a token-entry recovery screen.
 - WebSocket handshakes require a matching browser `Origin`, or a loopback client when `Origin` is omitted (common in embedded/IDE browsers).
 - Shutdown is allowed only from **loopback** clients with a valid token.
 - Manual traceroute requests are throttled (10 s cooldown).
@@ -254,6 +255,7 @@ python gms_web_server.py --allow-remote --bind 0.0.0.0 --access-token "your-long
 - Requires an operator-provided token (minimum 16 characters).
 - Prints a prominent exposure warning.
 - Does **not** print the token in the dashboard URL.
+- Enter the `--access-token` on the dashboard recovery screen, or set `VITE_ACCESS_TOKEN` for development builds.
 - Shutdown remains token-gated (loopback restriction is lifted in remote mode).
 - Missing `Origin` is **not** allowed in remote mode.
 
@@ -261,10 +263,15 @@ python gms_web_server.py --allow-remote --bind 0.0.0.0 --access-token "your-long
 
 `stop_gms_web.bat` only terminates processes whose command line contains `gms_web_server.py`. It will not kill unrelated services sharing the same port.
 
-### Running security tests
+### Running tests
 
 ```bash
-python -m unittest test_gms_web_security.py -v
+python -m pip install -r requirements_test.txt
+python -m unittest discover -v
+cd web
+npm install
+npm test
+npm run build
 ```
 
 ### Threat model
@@ -301,7 +308,9 @@ Localization files: `lang_en.txt`, `lang_id.txt`. Add a new `lang_xx.txt` and re
 | Blank page / "Frontend not built" | `cd web && npm install && npm run build` |
 | Port already in use | `stop_gms_web.bat` or pass `--port` with a different value |
 | "Unauthorized" banner | Open the secure URL printed at server startup; after restart, use the new URL |
-| Stuck on "Connecting..." / WebSocket 403 | Hard-refresh (`Ctrl+Shift+R`), or restart via `run_gms_web.bat` and open the fresh secure URL |
+| Stuck on "Connecting..." / WebSocket 403 | Hard-refresh (`Ctrl+Shift+R`), restart via `run_gms_web.bat`, and open the fresh secure URL |
+| Shutdown says server stopped but it is still running | Token may be invalid after refresh; use the recovery screen or restart from the printed secure URL |
+| `stop_gms_web.bat` on custom port | Use `stop_gms_web.bat 9000` when the server was started with `--port 9000` |
 | Vite dev won't connect | Start server with `--allowed-origin http://localhost:5173` and open `http://localhost:5173/#token=...` |
 | WebSocket disconnected | Confirm `gms_web_server.py` is running; check firewall for non-loopback binds |
 | Ping always times out | Verify the target host is reachable; on Windows, ICMP may need elevated rights for some targets |

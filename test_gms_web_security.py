@@ -18,11 +18,21 @@ from gms_web_server import (  # noqa: E402
     MonitorService,
     ServerSecurity,
     VALID_WS_ACTIONS,
+    WS_APP_PROTOCOL,
+    WS_TOKEN_PREFIX,
     create_app,
+    extract_ws_token,
     handle_ws_action,
     is_loopback_address,
     validate_bind_address,
 )
+
+
+def _ws_headers(origin: str, token: str) -> dict[str, str]:
+    return {
+        "Origin": origin,
+        "Sec-WebSocket-Protocol": f"{WS_APP_PROTOCOL}, {WS_TOKEN_PREFIX}{token}",
+    }
 
 
 class LoopbackTests(unittest.TestCase):
@@ -168,32 +178,33 @@ class ApiSecurityIntegrationTests(unittest.TestCase):
         with TestClient(self.app) as client:
             with self.assertRaises(Exception):
                 with client.websocket_connect(
-                    f"/ws?token={self.security.token}",
-                    headers={"Origin": "http://evil.example"},
+                    "/ws",
+                    headers=_ws_headers("http://evil.example", self.security.token),
                 ):
                     pass
 
     def test_websocket_accepts_authorized_client(self) -> None:
         with TestClient(self.app) as client:
             with client.websocket_connect(
-                f"/ws?token={self.security.token}",
-                headers={"Origin": self.origin},
+                "/ws",
+                headers=_ws_headers(self.origin, self.security.token),
             ) as ws:
                 payload = ws.receive_json()
                 self.assertEqual(payload["host"], "127.0.0.1")
+                self.assertIn("quality_code", payload)
 
     def test_websocket_enforces_client_limit(self) -> None:
         limited = ServerSecurity("127.0.0.1", 8765, max_ws_clients=1)
         app = create_app(self.monitor, limited)
         with TestClient(app) as client:
             with client.websocket_connect(
-                f"/ws?token={limited.token}",
-                headers={"Origin": self.origin},
+                "/ws",
+                headers=_ws_headers(self.origin, limited.token),
             ):
                 with self.assertRaises(Exception):
                     with client.websocket_connect(
-                        f"/ws?token={limited.token}",
-                        headers={"Origin": self.origin},
+                        "/ws",
+                        headers=_ws_headers(self.origin, limited.token),
                     ):
                         pass
 
