@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ConnectionStatus, MonitorSnapshot } from "../types/monitor";
+import { getAccessToken } from "../utils/accessToken";
 
-const WS_URL =
+const WS_BASE =
   import.meta.env.VITE_WS_URL ||
   `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws`;
+
+const TOKEN_HEADER = "X-GMS-Token";
 
 type UseMonitorSocketResult = {
   snapshot: MonitorSnapshot | null;
@@ -16,6 +19,11 @@ type UseMonitorSocketResult = {
   stopServer: () => Promise<void>;
 };
 
+function buildWebSocketUrl(token: string): string {
+  const separator = WS_BASE.includes("?") ? "&" : "?";
+  return `${WS_BASE}${separator}token=${encodeURIComponent(token)}`;
+}
+
 export function useMonitorSocket(): UseMonitorSocketResult {
   const [snapshot, setSnapshot] = useState<MonitorSnapshot | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
@@ -23,6 +31,7 @@ export function useMonitorSocket(): UseMonitorSocketResult {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectRef = useRef<number | null>(null);
   const stoppedRef = useRef(false);
+  const authFailedRef = useRef(false);
 
   const send = useCallback((payload: object) => {
     const ws = wsRef.current;
@@ -40,6 +49,7 @@ export function useMonitorSocket(): UseMonitorSocketResult {
   );
 
   const stopServer = useCallback(async () => {
+    const token = getAccessToken();
     stoppedRef.current = true;
     setStopped(true);
     if (reconnectRef.current) {
@@ -48,7 +58,11 @@ export function useMonitorSocket(): UseMonitorSocketResult {
     }
     wsRef.current?.close();
     try {
-      await fetch("/api/shutdown", { method: "POST" });
+      const headers: HeadersInit = {};
+      if (token) {
+        headers[TOKEN_HEADER] = token;
+      }
+      await fetch("/api/shutdown", { method: "POST", headers });
     } catch {
       // server may already be stopping
     }
@@ -58,9 +72,17 @@ export function useMonitorSocket(): UseMonitorSocketResult {
     let active = true;
 
     const connect = () => {
-      if (!active || stoppedRef.current) return;
+      if (!active || stoppedRef.current || authFailedRef.current) return;
+
+      const token = getAccessToken();
+      if (!token) {
+        authFailedRef.current = true;
+        setStatus("auth_error");
+        return;
+      }
+
       setStatus("connecting");
-      const ws = new WebSocket(WS_URL);
+      const ws = new WebSocket(buildWebSocketUrl(token));
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -77,10 +99,15 @@ export function useMonitorSocket(): UseMonitorSocketResult {
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         if (!active) return;
         if (stoppedRef.current) {
           setStatus("disconnected");
+          return;
+        }
+        if (event.code === 1008) {
+          authFailedRef.current = true;
+          setStatus("auth_error");
           return;
         }
         setStatus("disconnected");

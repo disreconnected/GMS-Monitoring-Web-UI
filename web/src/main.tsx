@@ -7,6 +7,7 @@ import "@fontsource/geist-mono/400.css";
 import "@fontsource/geist-mono/500.css";
 import "./index.css";
 import App from "./App";
+import { consumeAccessTokenFromFragment } from "./utils/accessToken";
 
 try {
   const stored = localStorage.getItem("gms-theme");
@@ -18,6 +19,8 @@ try {
 } catch {
   document.documentElement.dataset.theme = "dark";
 }
+
+consumeAccessTokenFromFragment();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

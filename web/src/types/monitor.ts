@@ -79,6 +79,6 @@ export type MonitorSnapshot = {
   session: SessionInfo;
 };
 
-export type ConnectionStatus = "connecting" | "connected" | "disconnected";
+export type ConnectionStatus = "connecting" | "connected" | "disconnected" | "auth_error";
 
 export type AppView = "live" | "report";

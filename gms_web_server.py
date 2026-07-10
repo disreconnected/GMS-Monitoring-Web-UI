@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
+import logging
+import secrets
+import sys
 import threading
 import time
 from collections import deque
+from ipaddress import ip_address
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -35,6 +40,156 @@ from gms_monitor import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WEB_DIST = SCRIPT_DIR / "web" / "dist"
+
+logger = logging.getLogger("gms_web_server")
+
+VALID_WS_ACTIONS = frozenset({"pause", "resume", "traceroute", "set_window"})
+TRACEROUTE_COOLDOWN_SECONDS = 10.0
+DEFAULT_MAX_WS_CLIENTS = 5
+TOKEN_HEADER = "x-gms-token"
+
+
+def is_loopback_address(addr: str | None) -> bool:
+    if not addr:
+        return False
+    try:
+        return ip_address(addr).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_bind_address(bind: str, allow_remote: bool) -> None:
+    if allow_remote:
+        return
+    if bind in {"0.0.0.0", "::"}:
+        raise SystemExit(
+            "Binding to all interfaces requires --allow-remote and --access-token."
+        )
+    if not is_loopback_address(bind):
+        raise SystemExit(
+            f"Bind address {bind!r} is not loopback. "
+            "Use --allow-remote with --access-token to expose the server."
+        )
+
+
+class ServerSecurity:
+    """Per-process auth, origin policy, and WebSocket admission control."""
+
+    def __init__(
+        self,
+        bind: str,
+        port: int,
+        *,
+        allow_remote: bool = False,
+        access_token: str | None = None,
+        allowed_origins: list[str] | None = None,
+        max_ws_clients: int = DEFAULT_MAX_WS_CLIENTS,
+        traceroute_cooldown: float = TRACEROUTE_COOLDOWN_SECONDS,
+    ) -> None:
+        self.bind = bind
+        self.port = port
+        self.remote_mode = allow_remote
+        self.max_ws_clients = max(1, max_ws_clients)
+        self.traceroute_cooldown = traceroute_cooldown
+        self._ws_lock = threading.Lock()
+        self._ws_clients = 0
+        self._last_traceroute_request = 0.0
+
+        if allow_remote:
+            if not access_token or len(access_token) < 16:
+                raise SystemExit(
+                    "--allow-remote requires --access-token with at least 16 characters."
+                )
+            self.token = access_token
+        else:
+            self.token = secrets.token_urlsafe(32)
+
+        self.allowed_origins = self._build_allowed_origins(allowed_origins or [])
+
+    def _build_allowed_origins(self, extra_origins: list[str]) -> set[str]:
+        origins: set[str] = set(extra_origins)
+        display_hosts = {self.bind, "localhost", "127.0.0.1"}
+        if self.bind in {"0.0.0.0", "::"}:
+            display_hosts.update({"localhost", "127.0.0.1"})
+        for host in display_hosts:
+            for scheme in ("http", "https"):
+                origins.add(f"{scheme}://{host}:{self.port}")
+        return origins
+
+    def verify_token(self, token: str | None) -> bool:
+        if not token:
+            return False
+        return hmac.compare_digest(token, self.token)
+
+    def verify_origin(self, origin: str | None, client_host: str | None = None) -> bool:
+        if origin:
+            return origin in self.allowed_origins
+        # Some embedded/IDE browsers omit Origin on loopback WebSockets.
+        if not self.remote_mode and is_loopback_address(client_host):
+            return True
+        return False
+
+    def verify_loopback_peer(self, client_host: str | None) -> bool:
+        if self.remote_mode:
+            return True
+        return is_loopback_address(client_host)
+
+    def try_acquire_ws_slot(self) -> bool:
+        with self._ws_lock:
+            if self._ws_clients >= self.max_ws_clients:
+                return False
+            self._ws_clients += 1
+            return True
+
+    def release_ws_slot(self) -> None:
+        with self._ws_lock:
+            self._ws_clients = max(0, self._ws_clients - 1)
+
+    def can_trigger_traceroute(self) -> bool:
+        now = time.time()
+        if now - self._last_traceroute_request < self.traceroute_cooldown:
+            return False
+        self._last_traceroute_request = now
+        return True
+
+    def dashboard_url(self) -> str:
+        host = "127.0.0.1" if self.bind in {"0.0.0.0", "::"} else self.bind
+        base = f"http://{host}:{self.port}/"
+        if self.remote_mode:
+            return base
+        return f"{base}#token={self.token}"
+
+    def print_startup_banner(self) -> None:
+        print("=" * 60, file=sys.stderr)
+        if self.remote_mode:
+            print("WARNING: Remote mode enabled. Server is exposed on the network.", file=sys.stderr)
+            print(f"Dashboard: {self.dashboard_url()}", file=sys.stderr)
+            print("All control operations require --access-token.", file=sys.stderr)
+        else:
+            print(f"GMS Monitoring dashboard: {self.dashboard_url()}", file=sys.stderr)
+            print("Open the URL above in your browser (token is in the URL fragment).", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+
+
+def handle_ws_action(monitor: "MonitorService", security: ServerSecurity, msg: object) -> None:
+    if not isinstance(msg, dict):
+        return
+    action = msg.get("action")
+    if action not in VALID_WS_ACTIONS:
+        return
+    if action == "pause":
+        monitor.pause()
+    elif action == "resume":
+        monitor.resume()
+    elif action == "traceroute":
+        if security.can_trigger_traceroute():
+            monitor.rerun_traceroute()
+    elif action == "set_window":
+        try:
+            size = int(msg.get("size", 60))
+        except (TypeError, ValueError):
+            return
+        monitor.set_window_size(size)
 
 
 def _quality_label(
@@ -368,11 +523,24 @@ class MonitorService:
             self.state.running = False
 
 
-def create_app(monitor: MonitorService) -> FastAPI:
+def create_app(monitor: MonitorService, security: ServerSecurity) -> FastAPI:
     app = FastAPI(title="GMS Monitoring")
+    app.state.security = security
 
     @app.post("/api/shutdown")
-    async def shutdown_server() -> JSONResponse:
+    async def shutdown_server(
+        request: Request,
+        x_gms_token: str | None = Header(default=None, alias=TOKEN_HEADER),
+    ) -> JSONResponse:
+        client_host = request.client.host if request.client else None
+        if not security.verify_token(x_gms_token):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=403)
+        if not security.verify_loopback_peer(client_host):
+            return JSONResponse(
+                {"detail": "Shutdown allowed from loopback only"},
+                status_code=403,
+            )
+
         server = getattr(app.state, "server", None)
 
         def _stop() -> None:
@@ -385,6 +553,26 @@ def create_app(monitor: MonitorService) -> FastAPI:
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
+        origin = websocket.headers.get("origin")
+        token = websocket.query_params.get("token")
+        client_host = websocket.client.host if websocket.client else None
+
+        if not security.verify_token(token):
+            logger.warning("WebSocket rejected: invalid or missing token from %s", client_host)
+            await websocket.close(code=1008, reason="Unauthorized")
+            return
+        if not security.verify_origin(origin, client_host):
+            logger.warning(
+                "WebSocket rejected: origin %r not allowed from %s",
+                origin,
+                client_host,
+            )
+            await websocket.close(code=1008, reason="Origin not allowed")
+            return
+        if not security.try_acquire_ws_slot():
+            await websocket.close(code=1008, reason="Too many clients")
+            return
+
         await websocket.accept()
         try:
             while True:
@@ -392,22 +580,18 @@ def create_app(monitor: MonitorService) -> FastAPI:
                 await websocket.send_text(json.dumps(snapshot))
                 try:
                     raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
-                    msg = json.loads(raw)
-                    action = msg.get("action")
-                    if action == "pause":
-                        monitor.pause()
-                    elif action == "resume":
-                        monitor.resume()
-                    elif action == "traceroute":
-                        monitor.rerun_traceroute()
-                    elif action == "set_window":
-                        size = int(msg.get("size", 60))
-                        monitor.set_window_size(size)
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    handle_ws_action(monitor, security, msg)
                 except asyncio.TimeoutError:
                     pass
                 await asyncio.sleep(1.0)
         except WebSocketDisconnect:
             return
+        finally:
+            security.release_ws_slot()
 
     if WEB_DIST.is_dir():
         assets_dir = WEB_DIST / "assets"
@@ -420,7 +604,13 @@ def create_app(monitor: MonitorService) -> FastAPI:
                 return {"detail": "Use WebSocket"}
             index = WEB_DIST / "index.html"
             if index.is_file():
-                return FileResponse(index)
+                return FileResponse(
+                    index,
+                    headers={
+                        "Cache-Control": "no-store, no-cache, must-revalidate",
+                        "Pragma": "no-cache",
+                    },
+                )
             return {"detail": "Frontend not built. Run: cd web && npm run build"}
 
     else:
@@ -442,12 +632,47 @@ def main() -> None:
     parser.add_argument("--bind", default="127.0.0.1", help="bind address")
     parser.add_argument("--port", type=int, default=8765, help="HTTP port")
     parser.add_argument("--lang", default="en", choices=["en", "id"], help="UI language")
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow non-loopback bind; requires --access-token",
+    )
+    parser.add_argument(
+        "--access-token",
+        default=None,
+        help="shared control token for remote mode (min 16 chars)",
+    )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        dest="allowed_origins",
+        metavar="ORIGIN",
+        help="extra allowed browser Origin (repeatable; e.g. http://localhost:5173)",
+    )
+    parser.add_argument(
+        "--max-ws-clients",
+        type=int,
+        default=DEFAULT_MAX_WS_CLIENTS,
+        help="maximum concurrent WebSocket clients",
+    )
     args = parser.parse_args()
+
+    validate_bind_address(args.bind, args.allow_remote)
+    security = ServerSecurity(
+        args.bind,
+        args.port,
+        allow_remote=args.allow_remote,
+        access_token=args.access_token,
+        allowed_origins=args.allowed_origins,
+        max_ws_clients=args.max_ws_clients,
+    )
+    security.print_startup_banner()
 
     set_language(args.lang)
     monitor = MonitorService(args.host)
     monitor.start()
-    app = create_app(monitor)
+    app = create_app(monitor, security)
 
     import uvicorn
 
