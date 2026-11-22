@@ -49,6 +49,83 @@ export type SessionInfo = {
   uptime_seconds: number;
 };
 
+export type StormshieldBandwidthPoint = {
+  t: number;
+  rx_mbps: number;
+  tx_mbps: number;
+};
+
+export type StormshieldInterface = {
+  name: string;
+  real_name: string;
+  type: string;
+  addr: string;
+  state: number;
+  plugged: number;
+  protected: number;
+  link_mbps: number;
+  rx_mbps: number;
+  tx_mbps: number;
+  avg_rx_mbps: number;
+  avg_tx_mbps: number;
+  tcp_conn: number;
+  udp_conn: number;
+  history: StormshieldBandwidthPoint[];
+};
+
+export type StormshieldHost = {
+  addr: string;
+  mac: string;
+  name: string;
+  interface: string;
+  packets: number;
+  bytes_in: number;
+  bytes_out: number;
+  rx_mbps: number;
+  tx_mbps: number;
+  reputation: number;
+  geo: string;
+};
+
+export type StormshieldInfo = {
+  connected: boolean;
+  error: string | null;
+  model: string | null;
+  version: string | null;
+  host: string;
+  last_poll: number | null;
+  interfaces: StormshieldInterface[];
+  hosts: StormshieldHost[];
+  host_interfaces: string[];
+  hosts_error: string | null;
+  hosts_updated_at: number | null;
+  /** Interfaces whose host query timed out; retried after retry_at (unix seconds). */
+  hosts_slow?: { name: string; retry_at: number }[];
+};
+
+export type SnsSavedHost = {
+  host: string;
+  label: string;
+  last_seen: number | null;
+};
+
+export type SnsCandidate = {
+  host: string;
+  reachable: boolean;
+  stormshield: boolean;
+  latency_ms: number | null;
+};
+
+export type SnsState = {
+  active_host: string | null;
+  password_set: boolean;
+  saved_hosts: SnsSavedHost[];
+  candidates: SnsCandidate[];
+  probed_at: number | null;
+  busy: boolean;
+  message: string | null;
+};
+
 export type MonitorSnapshot = {
   host: string;
   timestamp: number;
@@ -78,6 +155,8 @@ export type MonitorSnapshot = {
     hops: TracerouteHop[];
   };
   session: SessionInfo;
+  stormshield?: StormshieldInfo;
+  sns?: SnsState;
 };
 
 export type ConnectionStatus =

@@ -27,6 +27,10 @@ type UseMonitorSocketResult = {
   resume: () => void;
   rerunTraceroute: () => void;
   setWindowSize: (size: number) => void;
+  snsConnect: (host: string, password?: string, label?: string) => void;
+  snsDisconnect: () => void;
+  snsDetect: () => void;
+  snsForget: (host: string) => void;
   stopServer: () => Promise<void>;
   submitToken: (token: string) => void;
 };
@@ -79,6 +83,23 @@ export function useMonitorSocket(): UseMonitorSocketResult {
   const rerunTraceroute = useCallback(() => send({ action: "traceroute" }), [send]);
   const setWindowSize = useCallback(
     (size: number) => send({ action: "set_window", size }),
+    [send],
+  );
+
+  const snsConnect = useCallback(
+    (host: string, password?: string, label?: string) =>
+      send({
+        action: "sns_connect",
+        host,
+        ...(password ? { password } : {}),
+        ...(label ? { label } : {}),
+      }),
+    [send],
+  );
+  const snsDisconnect = useCallback(() => send({ action: "sns_disconnect" }), [send]);
+  const snsDetect = useCallback(() => send({ action: "sns_detect" }), [send]);
+  const snsForget = useCallback(
+    (host: string) => send({ action: "sns_forget", host }),
     [send],
   );
 
@@ -224,6 +245,10 @@ export function useMonitorSocket(): UseMonitorSocketResult {
     resume,
     rerunTraceroute,
     setWindowSize,
+    snsConnect,
+    snsDisconnect,
+    snsDetect,
+    snsForget,
     stopServer,
     submitToken,
   };

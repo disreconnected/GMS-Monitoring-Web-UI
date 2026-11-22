@@ -66,7 +66,7 @@ function bucketStart(t: number, scaleSeconds: number) {
   return Math.floor(t / scaleSeconds) * scaleSeconds;
 }
 
-function bucketLatency(
+export function bucketLatency(
   points: MonitorSnapshot["ping_history"],
   scaleSeconds: number,
 ): LatencyBucket[] {
@@ -139,7 +139,7 @@ function liveBandwidth(points: BandwidthPoint[]): BandwidthBucket[] {
   }));
 }
 
-function LatencyTooltip({
+export function LatencyTooltip({
   active,
   payload,
   label,

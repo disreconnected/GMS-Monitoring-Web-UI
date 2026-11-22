@@ -1,4 +1,6 @@
 @import "tailwindcss";
+@import "react-grid-layout/css/styles.css";
+@import "react-resizable/css/styles.css";
 
 @theme {
   --font-display: "Outfit", ui-sans-serif, system-ui, sans-serif;
@@ -54,6 +56,38 @@ body {
   background-image:
     linear-gradient(rgba(0, 0, 0, 0.04) 1px, transparent 1px),
     linear-gradient(90deg, rgba(0, 0, 0, 0.04) 1px, transparent 1px);
+}
+
+/* Report dashboard grid (react-grid-layout) */
+.react-grid-item.react-grid-placeholder {
+  background: var(--color-accent);
+  opacity: 0.15;
+  border-radius: 2px;
+}
+
+/* Resize handle: a small corner triangle that reads on both themes. The handle
+   is only rendered while the layout is unlocked. */
+.react-grid-item > .react-resizable-handle {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  background-image: none;
+}
+
+.react-grid-item > .react-resizable-handle::after {
+  right: 2px;
+  bottom: 2px;
+  width: 0;
+  height: 0;
+  border-right: 0;
+  border-left: 9px solid transparent;
+  border-bottom: 9px solid var(--color-fg-muted);
+  opacity: 0.8;
+}
+
+.react-grid-item > .react-resizable-handle:hover::after {
+  border-bottom-color: var(--color-fg);
+  opacity: 1;
 }
 
 @media (prefers-reduced-motion: reduce) {

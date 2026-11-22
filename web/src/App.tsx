@@ -4,6 +4,7 @@ import { DisconnectedBanner } from "./components/DisconnectedBanner";
 import { HeroSection } from "./components/HeroSection";
 import { AlertTicker } from "./components/AlertTicker";
 import { BentoCharts } from "./components/BentoCharts";
+import { FirewallSection } from "./components/FirewallSection";
 import { TracerouteStack } from "./components/TracerouteStack";
 import { RecentPingsTable } from "./components/RecentPingsTable";
 import { SessionDetailPanel } from "./components/SessionDetailPanel";
@@ -79,6 +80,10 @@ export default function App() {
     pause,
     resume,
     rerunTraceroute,
+    snsConnect,
+    snsDisconnect,
+    snsDetect,
+    snsForget,
     stopServer,
     submitToken,
   } = useMonitorSocket();
@@ -136,6 +141,17 @@ export default function App() {
       <HeroSection snapshot={snapshot} status={status} isStale={isStale} />
       <AlertTicker alerts={snapshot?.alerts ?? []} />
       <BentoCharts snapshot={snapshot} isStale={isStale} />
+      {snapshot?.sns ? (
+        <FirewallSection
+          stormshield={snapshot.stormshield ?? null}
+          sns={snapshot.sns}
+          controlsEnabled={controlsEnabled}
+          onConnect={snsConnect}
+          onDisconnect={snsDisconnect}
+          onDetect={snsDetect}
+          onForget={snsForget}
+        />
+      ) : null}
       <section className="px-4 py-12 md:px-8">
         <div className="mx-auto grid max-w-7xl grid-cols-1 gap-4 md:grid-cols-2">
           <RecentPingsTable pingHistory={snapshot?.ping_history ?? []} />
