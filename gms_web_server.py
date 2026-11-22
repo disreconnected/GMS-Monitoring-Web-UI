@@ -8,6 +8,7 @@ import asyncio
 import hmac
 import json
 import logging
+import os
 import secrets
 import sys
 import threading
@@ -15,6 +16,7 @@ import time
 from collections import deque
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Any, Callable
 
 from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -38,13 +40,34 @@ from gms_monitor import (
     tr,
     validate_target_host,
 )
+from gms_sns_sites import (
+    default_candidates,
+    default_sites_path,
+    empty_sites,
+    forget_host,
+    load_sites,
+    probe_candidates,
+    remember_host,
+    save_sites,
+)
+from gms_stormshield import (
+    DEFAULT_POLL_INTERVAL,
+    DEFAULT_SNS_PORT,
+    StormshieldConfig,
+    StormshieldPoller,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WEB_DIST = SCRIPT_DIR / "web" / "dist"
 
 logger = logging.getLogger("gms_web_server")
 
-VALID_WS_ACTIONS = frozenset({"pause", "resume", "traceroute", "set_window"})
+SNS_WS_ACTIONS = frozenset({"sns_connect", "sns_disconnect", "sns_detect", "sns_forget"})
+VALID_WS_ACTIONS = frozenset({"pause", "resume", "traceroute", "set_window"}) | SNS_WS_ACTIONS
+SNS_PASSWORD_ENV = "GMS_SNS_PASSWORD"
+MAX_SNS_HOST_LENGTH = 253
+MAX_SNS_PASSWORD_LENGTH = 256
+MAX_SNS_LABEL_INPUT_LENGTH = 256
 TRACEROUTE_COOLDOWN_SECONDS = 10.0
 DEFAULT_MAX_WS_CLIENTS = 5
 TOKEN_HEADER = "x-gms-token"
@@ -192,13 +215,341 @@ class ServerSecurity:
         print("=" * 60, file=sys.stderr)
 
 
-def handle_ws_action(monitor: "MonitorService", security: ServerSecurity, msg: object) -> None:
+class SnsManager:
+    """Owns the replaceable Stormshield poller, its password and the saved sites.
+
+    Long operations (connect, disconnect, detect, autoconnect) run on one worker
+    thread at a time so the WebSocket loop never blocks; a second request while one
+    is running is refused with a message. The password lives only in this object's
+    memory: it is never logged, written to the sites file or put in a snapshot.
+    """
+
+    def __init__(
+        self,
+        *,
+        sites_path: Path | None = None,
+        password: str = "",
+        user: str | None = None,
+        port: int = DEFAULT_SNS_PORT,
+        interval: float = DEFAULT_POLL_INTERVAL,
+        cabundle: str | None = None,
+        host_interfaces: list[str] | None = None,
+        poller_factory: Callable[[StormshieldConfig], Any] | None = None,
+        on_poller_change: Callable[[Any], None] | None = None,
+    ) -> None:
+        self._lock = threading.RLock()
+        self._sites_path = sites_path
+        self._sites = load_sites(sites_path) if sites_path is not None else empty_sites()
+        self._password = password
+        self._password_from_env = bool(password)
+        self._user = user or self._sites["user"]
+        self._port = port
+        self._interval = interval
+        self._cabundle = cabundle
+        self._host_interfaces = list(host_interfaces) if host_interfaces else None
+        self._factory = poller_factory or StormshieldPoller
+        self.on_poller_change = on_poller_change
+        self._poller: Any = None
+        self._active_host: str | None = None
+        self._candidates: list[dict] = []
+        self._probed_at: float | None = None
+        self._busy = False
+        self._closed = False
+        self._message: str | None = None
+        self._worker: threading.Thread | None = None
+        self._tls_warned = False
+
+    @property
+    def poller(self) -> Any:
+        with self._lock:
+            return self._poller
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "active_host": self._active_host,
+                "password_set": bool(self._password),
+                "saved_hosts": [
+                    {
+                        "host": entry["host"],
+                        "label": entry["label"],
+                        "last_seen": entry["last_seen"],
+                    }
+                    for entry in self._sites["hosts"]
+                ],
+                "candidates": [dict(candidate) for candidate in self._candidates],
+                "probed_at": self._probed_at,
+                "busy": self._busy,
+                "message": self._message,
+            }
+
+    def join(self, timeout: float | None = 5.0) -> None:
+        """Wait for the running worker thread (used by tests and shutdown)."""
+        worker = self._worker
+        if worker is not None:
+            worker.join(timeout)
+
+    # -- worker plumbing -------------------------------------------------------
+
+    def _begin(self, message: str) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            if self._busy:
+                self._message = "another firewall operation is still running"
+                return False
+            self._busy = True
+            self._message = message
+            return True
+
+    def _spawn(self, work: Callable[[], str | None]) -> None:
+        def run() -> None:
+            message: str | None = None
+            try:
+                message = work()
+            except Exception:
+                logger.exception("Stormshield operation failed")
+                message = "firewall operation failed (see server log)"
+            finally:
+                with self._lock:
+                    self._busy = False
+                    self._message = message
+
+        self._worker = threading.Thread(target=run, name="sns-manager", daemon=True)
+        self._worker.start()
+
+    def _publish(self, poller: Any) -> None:
+        if self.on_poller_change is not None:
+            self.on_poller_change(poller)
+
+    def _save_sites(self) -> None:
+        if self._sites_path is None:
+            return
+        try:
+            save_sites(self._sites_path, self._sites)
+        except OSError as exc:
+            logger.warning("Could not save %s: %s", self._sites_path, exc)
+
+    def _make_config(self, host: str, password: str) -> StormshieldConfig:
+        return StormshieldConfig(
+            host=host,
+            user=self._user,
+            password=password,
+            port=self._port,
+            interval=max(1.0, self._interval),
+            # Factory SNS certificates use the serial number as CN, not the IP/hostname.
+            sslverifyhost=False,
+            sslverifypeer=bool(self._cabundle),
+            cabundle=self._cabundle,
+            host_interfaces=self._host_interfaces,
+        )
+
+    def _detach_poller(self) -> Any:
+        """Take the current poller out of service; the caller stops it."""
+        with self._lock:
+            old = self._poller
+            self._poller = None
+            self._active_host = None
+            self._publish(None)
+            return old
+
+    # -- poller lifecycle ------------------------------------------------------
+
+    def adopt(self, poller: Any) -> None:
+        """Use an already built poller as the current one (no sites bookkeeping)."""
+        with self._lock:
+            self._poller = poller
+            self._active_host = getattr(getattr(poller, "config", None), "host", None)
+            self._publish(poller)
+
+    def activate(self, host: str, label: str = "") -> None:
+        """Replace the current poller with one for ``host``; blocks while the old one stops."""
+        old = self._detach_poller()
+        if old is not None:
+            old.stop(True)
+        with self._lock:
+            password = self._password
+            warn_tls = not self._cabundle and not self._tls_warned
+            self._tls_warned = self._tls_warned or warn_tls
+        if warn_tls:
+            logger.warning(
+                "SNS TLS certificate is not verified (use --sns-cabundle to verify)"
+            )
+        poller = self._factory(self._make_config(host, password))
+        poller.start()
+        with self._lock:
+            closed = self._closed
+            if not closed:
+                self._poller = poller
+                self._active_host = host
+                self._publish(poller)
+                remember_host(self._sites, host, label)
+                self._save_sites()
+        if closed:
+            poller.stop(True)
+
+    def connect(self, host: str, password: str | None = None, label: str = "") -> bool:
+        """Start (in a thread) a poller for ``host``. Returns False when refused."""
+        host = host.strip()
+        try:
+            if not host or len(host) > MAX_SNS_HOST_LENGTH:
+                raise ValueError
+            host = validate_target_host(host)
+        except ValueError:
+            with self._lock:
+                self._message = "invalid firewall address"
+            return False
+        with self._lock:
+            if password and self._password_from_env:
+                self._message = f"the password is set by {SNS_PASSWORD_ENV} and cannot be changed here"
+                return False
+            if not password and not self._password:
+                self._message = "enter the firewall password to connect"
+                return False
+            if not self._begin(f"connecting to {host}"):
+                return False
+            if password:
+                self._password = password
+        self._spawn(lambda: self._connect_work(host, label))
+        return True
+
+    def _connect_work(self, host: str, label: str) -> str | None:
+        self.activate(host, label)
+        return None
+
+    def disconnect(self) -> bool:
+        """Stop the poller (in a thread) and forget a memory-only password."""
+        if not self._begin("disconnecting"):
+            return False
+        self._spawn(self._disconnect_work)
+        return True
+
+    def _disconnect_work(self) -> str | None:
+        old = self._detach_poller()
+        with self._lock:
+            if not self._password_from_env:
+                self._password = ""
+        if old is not None:
+            old.stop(True)
+        return None
+
+    def forget(self, host: str) -> None:
+        with self._lock:
+            forget_host(self._sites, host)
+            self._save_sites()
+
+    def shutdown(self) -> None:
+        """Stop the poller and refuse further connects (server is exiting)."""
+        with self._lock:
+            self._closed = True
+        old = self._detach_poller()
+        if old is not None:
+            old.stop(True)
+
+    # -- discovery -------------------------------------------------------------
+
+    def _probe(self) -> list[dict]:
+        with self._lock:
+            sites = {
+                "user": self._sites["user"],
+                "hosts": [dict(entry) for entry in self._sites["hosts"]],
+                "last_host": self._sites["last_host"],
+            }
+        candidates = default_candidates(sites)
+        results = probe_candidates(candidates, port=self._port) if candidates else []
+        with self._lock:
+            self._candidates = results
+            self._probed_at = time.time()
+        return results
+
+    def detect(self) -> bool:
+        """Probe saved hosts and the default gateway (in a thread) for Stormshield pages."""
+        if not self._begin("scanning for Stormshield firewalls"):
+            return False
+        self._spawn(self._detect_work)
+        return True
+
+    def _detect_work(self) -> str | None:
+        results = self._probe()
+        if not results:
+            return "no candidate addresses to probe"
+        if not any(result["stormshield"] for result in results):
+            return f"no Stormshield found among {len(results)} candidates"
+        return None
+
+    def autoconnect(self, announce: Callable[[str], None] | None = None) -> bool:
+        """At startup: connect to the first SAVED site that answers as a Stormshield.
+
+        Gateway guesses are probed for the UI's candidate list but never chosen
+        here, so the stored password only ever goes to a site the user saved.
+        """
+        say = announce or logger.info
+        with self._lock:
+            if self._poller is not None or not self._password or not self._sites["hosts"]:
+                return False
+            saved_hosts = {entry["host"] for entry in self._sites["hosts"]}
+        if not self._begin("looking for a saved Stormshield site"):
+            return False
+
+        def work() -> str | None:
+            results = self._probe()
+            chosen = next(
+                (r["host"] for r in results if r["stormshield"] and r["host"] in saved_hosts),
+                None,
+            )
+            if chosen is None:
+                say("Stormshield autoconnect: no saved Stormshield site reachable")
+                return f"no Stormshield found among {len(results)} candidates"
+            say(f"Stormshield autoconnect: connecting to {chosen}")
+            self.activate(chosen)
+            return None
+
+        self._spawn(work)
+        return True
+
+
+def _handle_sns_action(sns: SnsManager | None, action: str, msg: dict) -> None:
+    if sns is None:
+        return
+    if action == "sns_connect":
+        host = msg.get("host")
+        password = msg.get("password")
+        label = msg.get("label")
+        if not isinstance(host, str):
+            return
+        if password is not None and (
+            not isinstance(password, str) or len(password) > MAX_SNS_PASSWORD_LENGTH
+        ):
+            return
+        if label is not None and (
+            not isinstance(label, str) or len(label) > MAX_SNS_LABEL_INPUT_LENGTH
+        ):
+            return
+        sns.connect(host, password or None, label or "")
+    elif action == "sns_disconnect":
+        sns.disconnect()
+    elif action == "sns_detect":
+        sns.detect()
+    elif action == "sns_forget":
+        host = msg.get("host")
+        if isinstance(host, str):
+            sns.forget(host)
+
+
+def handle_ws_action(
+    monitor: "MonitorService",
+    security: ServerSecurity,
+    msg: object,
+    sns: SnsManager | None = None,
+) -> None:
     if not isinstance(msg, dict):
         return
     action = msg.get("action")
     if action not in VALID_WS_ACTIONS:
         return
-    if action == "pause":
+    if action in SNS_WS_ACTIONS:
+        _handle_sns_action(sns, action, msg)
+    elif action == "pause":
         monitor.pause()
     elif action == "resume":
         monitor.resume()
@@ -310,6 +661,10 @@ def _collect_alerts(state: MonitorState, snapshot: dict) -> list[dict]:
         consecutive_rto = state.consecutive_rto
         rto_burst_threshold = state.rto_burst_threshold
         rto_history = list(state.rto_history)
+        source_error = state.source_error
+
+    if source_error:
+        alerts.append({"time": now, "level": "error", "msg": source_error})
 
     short_loss_pct, short_avg_ping, short_count, _, _, short_max_ping, _ = compute_recent_stats(
         ping_history, SHORT_WINDOW_SIZE
@@ -375,7 +730,12 @@ def _collect_alerts(state: MonitorState, snapshot: dict) -> list[dict]:
     return alerts
 
 
-def build_snapshot(state: MonitorState, monitor: "MonitorService | None" = None) -> dict:
+def build_snapshot(
+    state: MonitorState,
+    monitor: "MonitorService | None" = None,
+    stormshield: StormshieldPoller | None = None,
+    sns: SnsManager | None = None,
+) -> dict:
     with state.lock:
         target_host = state.target_host
         monitoring = state.monitoring
@@ -505,12 +865,17 @@ def build_snapshot(state: MonitorState, monitor: "MonitorService | None" = None)
         snapshot["alert_log"] = list(monitor.alert_log)
     else:
         snapshot["alert_log"] = []
+    if stormshield is not None:
+        snapshot["stormshield"] = stormshield.snapshot()
+    if sns is not None:
+        snapshot["sns"] = sns.snapshot()
     return snapshot
 
 
 class MonitorService:
-    def __init__(self, target_host: str):
+    def __init__(self, target_host: str, source_interface: str | None = None):
         self.state = MonitorState(validate_target_host(target_host))
+        self.state.source_interface = source_interface
         self._threads: list[threading.Thread] = []
         self.started_at = time.time()
         self.alert_log: deque = deque(maxlen=50)
@@ -571,9 +936,22 @@ class MonitorService:
             self.state.running = False
 
 
-def create_app(monitor: MonitorService, security: ServerSecurity) -> FastAPI:
+def create_app(
+    monitor: MonitorService,
+    security: ServerSecurity,
+    stormshield: StormshieldPoller | None = None,
+    sns: SnsManager | None = None,
+) -> FastAPI:
     app = FastAPI(title="GMS Monitoring")
+    if sns is None:
+        sns = SnsManager()  # in-memory sites: nothing is written to disk
+    # The poller is replaced at runtime; the manager keeps app.state.stormshield current.
+    sns.on_poller_change = lambda poller: setattr(app.state, "stormshield", poller)
+    if stormshield is not None:
+        sns.adopt(stormshield)
     app.state.security = security
+    app.state.sns = sns
+    app.state.stormshield = sns.poller
 
     @app.post("/api/shutdown")
     async def shutdown_server(
@@ -590,6 +968,7 @@ def create_app(monitor: MonitorService, security: ServerSecurity) -> FastAPI:
             )
 
         monitor.stop()
+        await asyncio.to_thread(sns.shutdown)
         server = getattr(app.state, "server", None)
 
         def _stop() -> None:
@@ -625,7 +1004,9 @@ def create_app(monitor: MonitorService, security: ServerSecurity) -> FastAPI:
         await websocket.accept(subprotocol=WS_APP_PROTOCOL)
         try:
             while True:
-                snapshot = build_snapshot(monitor.state, monitor)
+                snapshot = build_snapshot(
+                    monitor.state, monitor, app.state.stormshield, sns
+                )
                 await websocket.send_text(json.dumps(snapshot))
                 try:
                     raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
@@ -633,7 +1014,7 @@ def create_app(monitor: MonitorService, security: ServerSecurity) -> FastAPI:
                         msg = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    handle_ws_action(monitor, security, msg)
+                    handle_ws_action(monitor, security, msg, sns)
                 except asyncio.TimeoutError:
                     pass
                 await asyncio.sleep(1.0)
@@ -679,7 +1060,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="GMS Monitoring web server")
     parser.add_argument("--host", default=DEFAULT_TARGET_HOST, help="target host to monitor")
     parser.add_argument("--bind", default="127.0.0.1", help="bind address")
-    parser.add_argument("--port", type=int, default=8765, help="HTTP port")
+    parser.add_argument("--port", type=int, default=9847, help="HTTP port")
     parser.add_argument("--lang", default="en", choices=["en", "id"], help="UI language")
     parser.add_argument(
         "--allow-remote",
@@ -705,6 +1086,69 @@ def main() -> None:
         default=DEFAULT_MAX_WS_CLIENTS,
         help="maximum concurrent WebSocket clients",
     )
+    parser.add_argument(
+        "--sns-host",
+        default=None,
+        help="Stormshield SNS appliance hostname/IP (enables firewall monitoring)",
+    )
+    parser.add_argument(
+        "--sns-user",
+        default=None,
+        help=(
+            "SNS API username (read-only account recommended; "
+            "default: 'user' from the sites file, else gmsmonitoring)"
+        ),
+    )
+    parser.add_argument(
+        "--sns-port",
+        type=int,
+        default=DEFAULT_SNS_PORT,
+        help="SNS SSL API port (default 443)",
+    )
+    parser.add_argument(
+        "--sns-interval",
+        type=float,
+        default=DEFAULT_POLL_INTERVAL,
+        help="SNS poll interval in seconds (default 5)",
+    )
+    parser.add_argument(
+        "--sns-cabundle",
+        default=None,
+        help="Optional CA bundle PEM for SNS TLS verification",
+    )
+    parser.add_argument(
+        "--sns-host-ifaces",
+        default=None,
+        help=(
+            "Comma-separated SNS interface names to query for hosts "
+            "(default: every plugged LAN/protected interface)"
+        ),
+    )
+    parser.add_argument(
+        "--sns-sites",
+        default=None,
+        help=(
+            "JSON file of saved Stormshield sites "
+            "(default: gms_sns_sites.json next to this script; never stores a password)"
+        ),
+    )
+    parser.add_argument(
+        "--no-sns-autoconnect",
+        action="store_true",
+        help=(
+            "do not probe saved sites and connect automatically at startup "
+            "(autoconnect needs GMS_SNS_PASSWORD and a non-empty sites file)"
+        ),
+    )
+    parser.add_argument(
+        "--source-interface",
+        default=None,
+        help=(
+            'Windows adapter name (as in "Wi-Fi") to send pings and traceroute from and '
+            "to count throughput on, whatever the routing table prefers; an empty value "
+            "follows the routing table"
+        ),
+    )
     args = parser.parse_args()
 
     validate_bind_address(args.bind, args.allow_remote)
@@ -712,6 +1156,54 @@ def main() -> None:
         target_host = validate_target_host(args.host)
     except ValueError as exc:
         parser.error(str(exc))
+    source_interface = (args.source_interface or "").strip() or None
+    if source_interface:
+        if not sys.platform.startswith("win"):
+            parser.error("--source-interface is supported on Windows only")
+        if ":" in target_host:
+            parser.error(
+                "--source-interface sends from the adapter's IPv4 address; "
+                "give --host a name or an IPv4 address, or pass --source-interface \"\""
+            )
+        import psutil
+
+        known = list(psutil.net_if_stats())
+        if source_interface not in known:
+            parser.error(
+                f"--source-interface: no adapter named {source_interface!r}; "
+                f"adapters: {', '.join(known)}"
+            )
+
+    sns_password = os.environ.get(SNS_PASSWORD_ENV, "")
+    # Keep the password out of the environment inherited by ping/tracert children.
+    os.environ.pop(SNS_PASSWORD_ENV, None)
+    if args.sns_cabundle and not os.path.isfile(args.sns_cabundle):
+        parser.error(f"--sns-cabundle file not found: {args.sns_cabundle}")
+    if args.sns_host:
+        try:
+            args.sns_host = validate_target_host(args.sns_host)
+        except ValueError as exc:
+            parser.error(f"--sns-host: {exc}")
+        if not sns_password:
+            parser.error(
+                "--sns-host requires GMS_SNS_PASSWORD environment variable "
+                "(password is never accepted as a CLI argument)."
+            )
+    sns = SnsManager(
+        sites_path=Path(args.sns_sites) if args.sns_sites else default_sites_path(),
+        password=sns_password,
+        user=args.sns_user,
+        port=args.sns_port,
+        interval=args.sns_interval,
+        cabundle=args.sns_cabundle,
+        host_interfaces=[
+            name.strip()
+            for name in (args.sns_host_ifaces or "").split(",")
+            if name.strip()
+        ]
+        or None,
+    )
+
     security = ServerSecurity(
         args.bind,
         args.port,
@@ -723,16 +1215,34 @@ def main() -> None:
     security.print_startup_banner()
 
     set_language(args.lang)
-    monitor = MonitorService(target_host)
+    monitor = MonitorService(target_host, source_interface)
+    if source_interface:
+        print(
+            f"Pings, traceroute and throughput use adapter {source_interface!r} only",
+            file=sys.stderr,
+        )
     monitor.start()
-    app = create_app(monitor, security)
+    app = create_app(monitor, security, None, sns)
+    if args.sns_host:
+        # An explicit --sns-host wins over saved sites and autoconnect.
+        sns.activate(args.sns_host)
+        print(
+            f"Stormshield monitoring enabled for {args.sns_host}:{args.sns_port}",
+            file=sys.stderr,
+        )
+    elif not args.no_sns_autoconnect:
+        # Probes in a background thread; never delays server startup.
+        sns.autoconnect(announce=lambda line: print(line, file=sys.stderr))
 
     import uvicorn
 
     config = uvicorn.Config(app, host=args.bind, port=args.port, log_level="info")
     server = uvicorn.Server(config)
     app.state.server = server
-    server.run()
+    try:
+        server.run()
+    finally:
+        sns.shutdown()
 
 
 if __name__ == "__main__":

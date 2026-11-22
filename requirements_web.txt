@@ -2,3 +2,4 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 websockets==14.1
 psutil==6.1.1
+stormshield.sns.sslclient==1.1.1

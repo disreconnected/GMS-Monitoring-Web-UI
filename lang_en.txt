@@ -67,6 +67,7 @@ BW_VALUE_WAIT = waiting...
 BW_VALUE_ERROR = (counters n/a)
 BW_PAIR_MBPS = dn {down:.1f} / up {up:.1f} Mbps
 BW_ERROR_COUNTERS = Throughput counters unavailable
+SOURCE_IFACE_NO_IPV4 = Adapter "{name}" has no IPv4 address (disconnected?); pings and traceroute wait until it reconnects.
 
 QUALITY_LABEL = Quality
 QUALITY_UNKNOWN = Unknown

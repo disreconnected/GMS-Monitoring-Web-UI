@@ -10,3 +10,13 @@ venv/
 # Frontend
 web/node_modules/
 web/dist/
+
+# Local tooling
+.cursor/
+graphify-out/
+_temp/
+*.tsbuildinfo
+
+# Saved Stormshield sites (per-operator; atomic-write temp files too)
+gms_sns_sites.json
+gms_sns_sites.json.*.tmp

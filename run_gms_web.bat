@@ -64,8 +64,17 @@ echo Starting GMS Monitoring web server...
 echo The secure dashboard URL will be printed below by the server.
 echo Use that URL in your browser. After a restart, open the new URL again.
 echo.
+echo Optional Stormshield SNS monitoring:
+echo   Pick or add the firewall in the dashboard's Firewall section (saved in gms_sns_sites.json).
+echo   set GMS_SNS_PASSWORD=your-password   ^(optional: otherwise the dashboard asks once per run^)
+echo   With the password set, saved sites are probed and connected automatically at startup;
+echo   add --no-sns-autoconnect to skip that, or --sns-host 192.168.1.254 to force one firewall.
+echo.
+echo Pings, traceroute and throughput use the "Wi-Fi" adapter ^(church Wi-Fi^) only;
+echo   add --source-interface "Other name" to pick another, or --source-interface "" to follow Windows.
+echo.
 
-"%PYTHON%" gms_web_server.py %*
+"%PYTHON%" gms_web_server.py --source-interface "Wi-Fi" %*
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" call "%~dp0_pause_on_error.bat"
 exit /b %RC%

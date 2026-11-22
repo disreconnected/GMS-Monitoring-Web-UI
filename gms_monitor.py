@@ -8,6 +8,7 @@ import sys
 import time
 import re
 import os
+import socket
 from collections import deque
 from ipaddress import ip_address
 
@@ -207,6 +208,11 @@ class MonitorState:
         self.traceroute_summary = None
         self.last_traceroute_ts = None
 
+        # Windows adapter name (e.g. "Wi-Fi") that pings, traceroute and throughput are
+        # pinned to; None follows the OS routing. source_error is set while it has no IPv4.
+        self.source_interface: str | None = None
+        self.source_error: str | None = None
+
         # Throughput (all interfaces aggregate), sampled every BW_SAMPLE_INTERVAL
         self.bw_rx_mbps_history = deque(maxlen=BW_HISTORY_LENGTH)
         self.bw_tx_mbps_history = deque(maxlen=BW_HISTORY_LENGTH)
@@ -263,18 +269,24 @@ def _win_net_totals_powershell() -> tuple[int, int] | None:
         return None
 
 
-def get_net_io_totals() -> tuple[int, int] | None:
-    """Cumulative bytes (recv, sent) across interfaces; None if unavailable."""
+def get_net_io_totals(nic: str | None = None) -> tuple[int, int] | None:
+    """Cumulative bytes (recv, sent) across interfaces, or of adapter `nic` only;
+    None if unavailable."""
     try:
         import psutil
 
-        io = psutil.net_io_counters(pernic=False)
+        if nic is not None:
+            io = psutil.net_io_counters(pernic=True).get(nic)
+        else:
+            io = psutil.net_io_counters(pernic=False)
         if io is not None:
             return int(io.bytes_recv), int(io.bytes_sent)
     except ImportError:
         pass
     except Exception:
         pass
+    if nic is not None:
+        return None  # the fallbacks below only know the aggregate
 
     if _WIN32:
         return _win_net_totals_powershell()
@@ -292,7 +304,7 @@ def bandwidth_worker(state: MonitorState):
             if not state.running:
                 break
         time.sleep(BW_SAMPLE_INTERVAL)
-        totals = get_net_io_totals()
+        totals = get_net_io_totals(state.source_interface)
         if totals is None:
             with state.lock:
                 state.bw_last_error = tr("BW_ERROR_COUNTERS")
@@ -363,16 +375,44 @@ def bandwidth_anomaly_message(
     )
 
 
-def run_ping(host: str, timeout: float = 5.0):
+def _windows_ipv4_flag(host: str) -> list[str]:
+    """Force IPv4 for hostnames: Windows prefers IPv6, which some links (e.g. phone
+    tethers) route but silently drop for ICMP. IPv6 literals are left as given."""
+    return [] if ":" in host else ["-4"]
+
+
+def interface_ipv4(name: str) -> str | None:
+    """Current IPv4 address of adapter `name`, or None when it is down or has none.
+
+    Looked up on every use: the church DHCP hands the adapter a new address now and then.
+    """
+    try:
+        import psutil
+
+        stats = psutil.net_if_stats().get(name)
+        if stats is None or not stats.isup:
+            return None
+        for addr in psutil.net_if_addrs().get(name, []):
+            if addr.family == socket.AF_INET and not addr.address.startswith("169.254."):
+                return addr.address
+    except Exception:
+        pass
+    return None
+
+
+def run_ping(host: str, timeout: float = 5.0, source: str | None = None):
     """
     Run a single ping and return (success: bool, rtt_ms: float|None).
     Windows: ping -n 1; Unix/macOS: ping -c 1 -n (numeric, no DNS lookups).
+    `source` (Windows only) is the local IPv4 address to send from; Windows then
+    sends out of the adapter that owns it, whatever the routing table prefers.
     """
     try:
         if _WIN32:
             # -n count; -w timeout_ms per reply (not the same as Unix -W)
             w_ms = max(1000, int(timeout * 1000))
-            cmd = ["ping", "-n", "1", "-w", str(w_ms), host]
+            src = ["-S", source] if source else []
+            cmd = ["ping", *_windows_ipv4_flag(host), *src, "-n", "1", "-w", str(w_ms), host]
         else:
             cmd = ["ping", "-n", "-c", "1", host]
         proc = subprocess.run(
@@ -442,10 +482,29 @@ def ping_worker(state: MonitorState, interval: float):
                 break
             monitoring = state.monitoring
             host = state.target_host
+            source_interface = state.source_interface
 
         if monitoring:
             start_time = time.time()
-            success, rtt = run_ping(host)
+            if source_interface:
+                # Never fall back to another adapter: no address counts as a lost ping.
+                source = interface_ipv4(source_interface)
+                with state.lock:
+                    # The adapter is back: rerun a traceroute that failed without it.
+                    retrace = bool(
+                        source
+                        and state.source_error
+                        and state.last_traceroute_error
+                        and not state.traceroute_running
+                    )
+                    state.source_error = (
+                        None if source else tr("SOURCE_IFACE_NO_IPV4", name=source_interface)
+                    )
+                if retrace:
+                    threading.Thread(target=traceroute_worker, args=(state,), daemon=True).start()
+                success, rtt = run_ping(host, source=source) if source else (False, None)
+            else:
+                success, rtt = run_ping(host)
             elapsed = time.time() - start_time
             sample_time = time.time()
 
@@ -661,6 +720,151 @@ def parse_traceroute_hops(lines: list[str]) -> list[dict]:
     return hops
 
 
+_IP_SUCCESS = 0
+_IP_TTL_EXPIRED_TRANSIT = 11013
+_IP_REQ_TIMED_OUT = 11010
+# Destination net / host / protocol / port unreachable: the trace ends at that hop.
+_IP_UNREACHABLE = frozenset({11002, 11003, 11004, 11005})
+_TRACE_MAX_HOPS = 30
+_TRACE_PROBES = 3
+_TRACE_TIMEOUT_MS = 4000  # tracert's default per probe
+
+
+def _icmp_api():
+    """Load iphlpapi's ICMP functions (Windows only); cached after the first call."""
+    global _ICMP_API
+    if _ICMP_API is not None:
+        return _ICMP_API
+    import ctypes
+    from ctypes import wintypes
+
+    class IpOptionInformation(ctypes.Structure):
+        _fields_ = [
+            ("Ttl", ctypes.c_ubyte),
+            ("Tos", ctypes.c_ubyte),
+            ("Flags", ctypes.c_ubyte),
+            ("OptionsSize", ctypes.c_ubyte),
+            ("OptionsData", ctypes.c_void_p),
+        ]
+
+    class IcmpEchoReply(ctypes.Structure):
+        _fields_ = [
+            ("Address", ctypes.c_ulong),
+            ("Status", ctypes.c_ulong),
+            ("RoundTripTime", ctypes.c_ulong),
+            ("DataSize", ctypes.c_ushort),
+            ("Reserved", ctypes.c_ushort),
+            ("Data", ctypes.c_void_p),
+            ("Options", IpOptionInformation),
+        ]
+
+    lib = ctypes.WinDLL("iphlpapi.dll", use_last_error=True)
+    lib.IcmpCreateFile.restype = wintypes.HANDLE
+    lib.IcmpCreateFile.argtypes = []
+    lib.IcmpCloseHandle.restype = wintypes.BOOL
+    lib.IcmpCloseHandle.argtypes = [wintypes.HANDLE]
+    lib.IcmpSendEcho2Ex.restype = wintypes.DWORD
+    lib.IcmpSendEcho2Ex.argtypes = [
+        wintypes.HANDLE,  # IcmpHandle
+        wintypes.HANDLE,  # Event
+        ctypes.c_void_p,  # ApcRoutine
+        ctypes.c_void_p,  # ApcContext
+        ctypes.c_ulong,  # SourceAddress
+        ctypes.c_ulong,  # DestinationAddress
+        ctypes.c_void_p,  # RequestData
+        ctypes.c_ushort,  # RequestSize
+        ctypes.POINTER(IpOptionInformation),
+        ctypes.c_void_p,  # ReplyBuffer
+        wintypes.DWORD,  # ReplySize
+        wintypes.DWORD,  # Timeout (ms)
+    ]
+    _ICMP_API = (ctypes, lib, IpOptionInformation, IcmpEchoReply)
+    return _ICMP_API
+
+
+_ICMP_API = None
+
+
+def _ipaddr(ip: str) -> int:
+    """IPv4 text to the IPAddr the ICMP API takes (network byte order in memory)."""
+    return int.from_bytes(socket.inet_aton(ip), "little")
+
+
+def _tracert_cell(rtt_ms: int | None) -> str:
+    """One probe column in Windows tracert style, so the existing parsers read it."""
+    if rtt_ms is None:
+        return "   *    "
+    if rtt_ms < 1:
+        return "  <1 ms "
+    return f"{rtt_ms:>4} ms "
+
+
+def icmp_trace_lines(host: str, source: str, cancel: threading.Event):
+    """Traceroute sent from local IPv4 `source`, yielding Windows tracert-style lines.
+
+    Windows' tracert can pick a source address only for IPv6, so this sends the
+    TTL-limited echoes itself through the ICMP API (no admin rights needed).
+    """
+    ctypes, lib, IpOptionInformation, IcmpEchoReply = _icmp_api()
+    dest = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+    yield f"Tracing route to {host} [{dest}] from {source}"
+    yield f"over a maximum of {_TRACE_MAX_HOPS} hops:"
+    yield ""
+
+    handle = lib.IcmpCreateFile()
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise OSError(ctypes.get_last_error(), "IcmpCreateFile failed")
+    payload = ctypes.create_string_buffer(b"gms-monitoring-traceroute-probe!", 32)
+    reply_size = ctypes.sizeof(IcmpEchoReply) + len(payload) + 8 + 64
+    reply_buf = ctypes.create_string_buffer(reply_size)
+    src_addr, dst_addr = _ipaddr(source), _ipaddr(dest)
+    try:
+        for ttl in range(1, _TRACE_MAX_HOPS + 1):
+            cells: list[str] = []
+            hop_ip = None
+            reached = unreachable = False
+            for _ in range(_TRACE_PROBES):
+                if cancel.is_set():
+                    return
+                options = IpOptionInformation(Ttl=ttl)
+                count = lib.IcmpSendEcho2Ex(
+                    handle, None, None, None, src_addr, dst_addr,
+                    payload, len(payload), ctypes.byref(options),
+                    reply_buf, reply_size, _TRACE_TIMEOUT_MS,
+                )
+                if not count:
+                    error = ctypes.get_last_error()
+                    if error != _IP_REQ_TIMED_OUT:
+                        # Not a lost probe: typically the source address went away
+                        # (adapter disconnected or DHCP renumbered it) mid-trace.
+                        raise OSError(error, f"ICMP send from {source} failed")
+                    cells.append(_tracert_cell(None))
+                    continue
+                reply = IcmpEchoReply.from_buffer(reply_buf)
+                if reply.Status in (_IP_SUCCESS, _IP_TTL_EXPIRED_TRANSIT) or (
+                    reply.Status in _IP_UNREACHABLE
+                ):
+                    cells.append(_tracert_cell(reply.RoundTripTime))
+                    hop_ip = socket.inet_ntoa(reply.Address.to_bytes(4, "little"))
+                    reached = reached or reply.Status == _IP_SUCCESS
+                    unreachable = unreachable or reply.Status in _IP_UNREACHABLE
+                else:
+                    cells.append(_tracert_cell(None))
+            if not hop_ip:
+                tail = "Request timed out."
+            elif unreachable and not reached:
+                tail = f"{hop_ip} reports: Destination unreachable."
+            else:
+                tail = hop_ip
+            yield f"{ttl:>3}  {''.join(cells)} {tail}"
+            if reached or unreachable:
+                break
+    finally:
+        lib.IcmpCloseHandle(handle)
+    yield ""
+    yield "Trace complete."
+
+
 def traceroute_worker(state: MonitorState):
     """Run traceroute and stream output lines into state.traceroute_lines.
 
@@ -676,37 +880,52 @@ def traceroute_worker(state: MonitorState):
         # Record start time for this run
         state.last_traceroute_ts = time.time()
         host = state.target_host
+        source_interface = state.source_interface
+    proc = None
+    cancel = threading.Event()
     try:
-        # Use Popen so we can stream output line by line.
-        if _WIN32:
-            cmd = ["tracert", "-d", "-h", "30", host]
+        if source_interface:
+            source = interface_ipv4(source_interface)
+            if source is None:
+                raise OSError(tr("SOURCE_IFACE_NO_IPV4", name=source_interface))
+            output = icmp_trace_lines(host, source, cancel)
         else:
-            cmd = ["traceroute", host]
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            **_subprocess_no_window_kwargs(),
-        )
+            # Use Popen so we can stream output line by line.
+            if _WIN32:
+                cmd = ["tracert", *_windows_ipv4_flag(host), "-d", "-h", "30", host]
+            else:
+                cmd = ["traceroute", host]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                **_subprocess_no_window_kwargs(),
+            )
+            output = proc.stdout
     except Exception as e:
         with state.lock:
             state.traceroute_lines = []
-            state.last_traceroute_error = f"Error starting traceroute: {e!r}"
+            state.last_traceroute_error = (
+                str(e) if source_interface else f"Error starting traceroute: {e!r}"
+            )
             state.traceroute_running = False
         return
 
     lines = []
     start_time = time.time()
     error_msg = None
+    reader_errors: list[BaseException] = []
     line_queue: queue.Queue[str | None] = queue.Queue()
 
     def _reader() -> None:
         try:
-            assert proc.stdout is not None
-            for raw_line in proc.stdout:
+            assert output is not None
+            for raw_line in output:
                 line_queue.put(raw_line.rstrip("\n"))
+        except Exception as e:  # icmp_trace_lines: DNS or ICMP API failure
+            reader_errors.append(e)
         finally:
             line_queue.put(None)
 
@@ -715,7 +934,9 @@ def traceroute_worker(state: MonitorState):
     try:
         while True:
             if time.time() - start_time > 300:
-                proc.kill()
+                if proc is not None:
+                    proc.kill()
+                cancel.set()
                 error_msg = "traceroute timed out after 300 seconds"
                 break
             try:
@@ -728,16 +949,21 @@ def traceroute_worker(state: MonitorState):
             with state.lock:
                 state.traceroute_lines = list(lines)
 
-        # Wait for process to exit (short timeout just for cleanup)
-        try:
-            retcode = proc.wait(timeout=5)
-        except Exception:
-            retcode = None
+        if proc is not None:
+            # Wait for process to exit (short timeout just for cleanup)
+            try:
+                retcode = proc.wait(timeout=5)
+            except Exception:
+                retcode = None
 
-        if error_msg is None and retcode not in (0, None):
-            error_msg = f"traceroute exited with code {retcode}"
+            if error_msg is None and retcode not in (0, None):
+                error_msg = f"traceroute exited with code {retcode}"
+        elif error_msg is None and reader_errors:
+            error_msg = f"Error running traceroute: {reader_errors[0]!r}"
     except Exception as e:
         error_msg = f"Error running traceroute: {e!r}"
+    finally:
+        cancel.set()  # stop an ICMP trace this loop no longer reads
 
     summary = build_traceroute_summary(lines) if error_msg is None else None
 

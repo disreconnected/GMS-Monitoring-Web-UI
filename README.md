@@ -21,6 +21,7 @@ Default monitor target: `www.youtube.com` (configurable).
 | **Report view** | One-screen layout designed for a single screenshot — key metrics, recent pings, full traceroute table, alerts |
 | **Charts** | Shared time scale: **Live** (per ping), 1m, 5m, 10m, 15m, 30m, 1h — bucketed by max value per interval |
 | **Latency chart** | Y-axis capped at 150 ms; spikes above 150 ms are labeled with the real value |
+| **Firewall (optional)** | Stormshield SNS interface throughput charts + top hosts table (via SSL API) |
 | **Controls** | Pause / resume monitoring, re-run traceroute, stop server |
 | **Security** | Per-run access token, authenticated WebSocket/shutdown, loopback-only by default |
 | **Theme** | Light / dark toggle (persisted in browser) |
@@ -62,6 +63,8 @@ Installed automatically by `run_gms_web.bat`:
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 websockets>=12.0
+psutil>=6.0
+stormshield.sns.sslclient==1.1.1   # only needed for the Firewall section (also brings in requests)
 ```
 
 ### Frontend stack
@@ -84,7 +87,7 @@ This script will:
 2. Install `requirements_web.txt`
 3. Install frontend dependencies if needed (`npm install`)
 4. Rebuild the frontend (`npm run build`) so the served UI matches the current code
-5. Start the server (default bind: `127.0.0.1:8765`)
+5. Start the server (default bind: `127.0.0.1:9847`)
 
 **Open the secure URL printed by the server** — not a bookmarked address. It includes a one-time access token in the URL fragment (`#token=...`). After each restart, use the new URL. Use the **Live** tab for monitoring and **Report** for a screenshot-ready summary.
 
@@ -131,7 +134,7 @@ python gms_web_server.py
 With options:
 
 ```bash
-python gms_web_server.py --host example.com --bind 127.0.0.1 --port 8765 --lang id
+python gms_web_server.py --host example.com --bind 127.0.0.1 --port 9847 --lang id
 ```
 
 The server prints a **secure dashboard URL** on startup. Open that exact URL in your browser. After each restart, use the new URL (the token changes every run).
@@ -140,12 +143,52 @@ The server prints a **secure dashboard URL** on startup. Open that exact URL in 
 |--------|---------|-------------|
 | `--host` | `www.youtube.com` | Target host to ping and traceroute |
 | `--bind` | `127.0.0.1` | HTTP bind address (loopback only unless remote mode) |
-| `--port` | `8765` | HTTP port |
+| `--port` | `9847` | HTTP port |
 | `--lang` | `en` | UI language (`en` or `id`) |
 | `--allow-remote` | off | Allow non-loopback bind; requires `--access-token` |
 | `--access-token` | *(generated)* | Shared control token for remote mode (min 16 chars) |
 | `--allowed-origin` | — | Extra allowed browser `Origin` (repeatable; for Vite dev) |
 | `--max-ws-clients` | `5` | Maximum concurrent WebSocket clients |
+| `--sns-host` | — | Stormshield SNS appliance hostname/IP; connects at startup and overrides saved sites and autoconnect (needs `GMS_SNS_PASSWORD`) |
+| `--sns-user` | `user` in the sites file, else `gmsmonitoring` | SNS API username (prefer a read-only / `log_read` account) |
+| `--sns-sites` | `gms_sns_sites.json` next to the scripts | JSON file of saved Stormshield sites (never holds a password) |
+| `--no-sns-autoconnect` | off | Do not probe the saved sites and connect automatically at startup |
+| `--sns-port` | `443` | SNS SSL API port |
+| `--sns-interval` | `5` | SNS poll interval in seconds |
+| `--sns-cabundle` | — | Optional CA bundle PEM for SNS TLS verification |
+| `--sns-host-ifaces` | — | Comma-separated interface names to poll hosts on (default: every plugged LAN interface) |
+
+### Stormshield firewall monitoring (optional)
+
+Once the server is connected to an appliance it polls the SSL API (`MONITOR INTERFACE` / `MONITOR HOST`) and the Live dashboard fills its **Firewall** section with per-interface bandwidth charts and a top-hosts table. The section (with its firewall picker) is always on the Live view; until a firewall is connected it just says so. Hosts are polled only on plugged LAN (protected) interfaces because unfiltered `MONITOR HOST` queries hang on busy appliances (override with `--sns-host-ifaces`, which must name LAN interfaces: WAN host queries hang, so WAN names are skipped with a warning).
+
+Unless `--sns-cabundle` is given the SNS TLS certificate is **not** verified (a warning is printed when the first poller starts); with a bundle the certificate chain is verified but the hostname is not, because factory certificates use the appliance serial number as CN. `probe_sns.py` is a read-only diagnostic that prints the raw `SYSTEM PROPERTY`, `MONITOR INTERFACE` and `MONITOR HOST iface=<name>` replies (`--host-iface`) when a field looks wrong.
+
+#### Choosing the firewall (several sites)
+
+Each site has its own firewall with its own management IP, and that IP is usually neither the PC's default gateway nor in the PC's subnet, so it cannot be guessed reliably. The dashboard therefore remembers the firewalls you have used:
+
+- **Saved sites file** - `gms_sns_sites.json` next to the scripts (git-ignored; change it with `--sns-sites PATH`). Format: `{"user": "gmsmonitoring", "hosts": [{"host": "10.5.1.1", "label": "", "last_seen": 1760000000}], "last_host": "10.5.1.1"}`. A host is added, moved to the front and time-stamped every time you connect to it. **No password is ever written to this file.**
+- **Picker in the UI** - the Firewall section has a bar with the saved firewalls (plus a **×** to forget one), a field for a new address and an optional label, and **Connect**, **Detect** and **Disconnect** buttons. **Detect** probes the saved hosts, the PC's default gateway and the gateway's `x.y.z.1` over HTTPS and lists them as chips; the ones that answer like a Stormshield are badged, and clicking one fills the address field. The server does this in a background thread, so the dashboard stays responsive.
+- **Autoconnect** - at startup, when `--sns-host` is not given, `GMS_SNS_PASSWORD` is set and the sites file lists at least one host, the server probes the saved hosts (last used first) and the default gateway in the background and connects to the first one that looks like a Stormshield. One line on the console says which host was chosen, or that no saved Stormshield site was reachable. Use `--no-sns-autoconnect` to skip this. An explicit `--sns-host` always wins.
+
+#### Password
+
+The SNS password is **never** accepted as a CLI argument. Either set it in the environment (the server removes it from the environment of its child processes):
+
+```bat
+set GMS_SNS_PASSWORD=your-sns-password
+run_gms_web.bat
+```
+
+```bash
+export GMS_SNS_PASSWORD=your-sns-password
+python gms_web_server.py
+```
+
+or leave `GMS_SNS_PASSWORD` unset: the picker then asks for the password once per run. It travels over the dashboard's authenticated WebSocket, is kept in server memory only (never logged, saved, or sent back in a snapshot) and is forgotten on **Disconnect** or when the server stops. When `GMS_SNS_PASSWORD` is set the picker does not ask and refuses a password sent by a client. Use TLS (e.g. a reverse proxy) in front of the server if you run it with `--allow-remote`.
+
+`--sns-host 192.168.1.254` still works as before (and still requires `GMS_SNS_PASSWORD`). Enable the SSL API in the firewall's web administration ACL for the account you use.
 
 ### Frontend development (hot reload)
 
@@ -179,7 +222,12 @@ Open the modified secure URL above (not a bare `http://localhost:5173/`).
 gmsmonitoring/
 ├── gms_monitor.py           # Core monitor + TUI
 ├── gms_web_server.py        # FastAPI server + WebSocket (with auth)
+├── gms_stormshield.py       # Optional SNS firewall poller
+├── gms_sns_sites.py         # Saved SNS sites file + firewall discovery
+├── test_gms_monitor.py
 ├── test_gms_web_security.py # Security regression tests
+├── test_gms_stormshield.py  # SNS parse / rate / snapshot tests
+├── test_gms_sns_sites.py    # Saved sites / candidate / probe tests
 ├── requirements_web.txt
 ├── run_gms_web.bat       # Start web server (Windows)
 ├── stop_gms_web.bat      # Stop process on port (Windows)
@@ -231,9 +279,9 @@ The web server is a **local monitoring tool** with a per-run control token and a
 
 ### Default (local) mode
 
-- Binds to **loopback only** (`127.0.0.1:8765`). Non-loopback addresses are rejected unless remote mode is enabled.
+- Binds to **loopback only** (`127.0.0.1:9847`). Non-loopback addresses are rejected unless remote mode is enabled.
 - Generates a random **access token** on each startup.
-- Prints a secure dashboard URL: `http://127.0.0.1:8765/#token=<token>`
+- Prints a secure dashboard URL: `http://127.0.0.1:9847/#token=<token>`
 - The token lives in the URL **fragment** (not sent in HTTP requests or server logs).
 - The React client reads the fragment once, stores it in **sessionStorage** for the current tab, and sends it as:
   - WebSocket subprotocol: `gms-token.<token>` (negotiated with `gms-monitoring`)
